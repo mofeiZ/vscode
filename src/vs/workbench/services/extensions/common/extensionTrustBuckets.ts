@@ -29,6 +29,7 @@
 
 import product from '../../../../platform/product/common/product.js';
 import { ExtensionIdentifier, ExtensionIdentifierMap, IExtensionDescription } from '../../../../platform/extensions/common/extensions.js';
+import { readOptionalProcessEnv } from './rendererSafeEnv.js';
 
 /** product.json field (default false / absent). */
 export const TRUST_BUCKETING_PRODUCT_FIELD = 'trustBucketingEnabled';
@@ -88,9 +89,11 @@ function envFlagEnabled(raw: string | undefined): boolean {
  * Trust-bucketing enablement gate. Default OFF.
  *
  * Enabled when any of:
- * - env `VSCODE_TRUST_BUCKETING=1` / `true`
- * - product.json `trustBucketingEnabled: true`
+ * - env `VSCODE_TRUST_BUCKETING=1` / `true` (Node / test harness only)
+ * - product.json `trustBucketingEnabled: true` (renderer-safe via product accessor)
  * - test override via {@link _setTrustBucketingEnabledForTests}
+ *
+ * Never throws when `process` is undefined (sandboxed workbench).
  */
 export function isTrustBucketingEnabled(options: {
 	productEnabled?: boolean;
@@ -99,7 +102,7 @@ export function isTrustBucketingEnabled(options: {
 	if (_trustBucketingEnabledForTests !== undefined) {
 		return _trustBucketingEnabledForTests;
 	}
-	const env = options.env ?? process.env;
+	const env = options.env ?? readOptionalProcessEnv();
 	if (envFlagEnabled(env[TRUST_BUCKETING_ENV])) {
 		return true;
 	}

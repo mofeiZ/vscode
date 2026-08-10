@@ -16,6 +16,8 @@ import {
 	DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY,
 	DIAGNOSTIC_ISOLATION_DEMO_SEED_ID,
 	getDiagnosticIsolationIds,
+	INTERNAL_DIAGNOSTICS_ENV,
+	isDiagnosticIsolationDemoEnvEnabled,
 	isInternalDiagnosticsEnabled,
 	removeDiagnosticIsolation,
 } from '../../common/diagnosticIsolation.js';
@@ -29,7 +31,9 @@ import {
 	isTrustBucketingEnabled,
 	isTrustedExtension,
 	THIRD_PARTY_BUCKET_AFFINITY,
+	TRUST_BUCKETING_ENV,
 } from '../../common/extensionTrustBuckets.js';
+import { readOptionalProcessEnv } from '../../common/rendererSafeEnv.js';
 import { IWorkbenchEnvironmentService } from '../../../environment/common/environmentService.js';
 
 function createExtension(id: string, deps?: string[], extensionAffinity?: string[], opts?: { isBuiltin?: boolean; isUserBuiltin?: boolean; publisher?: string }): IExtensionDescription {
@@ -588,5 +592,68 @@ suite('ExtensionRunningLocationTracker - trust bucketing', () => {
 		assert.ok(locSuspect.affinity > 0, 'suspect isolated');
 		assert.notStrictEqual(locSuspect.affinity, locOther.affinity, 'diagnostic isolation is a further host beyond the 3P bucket');
 		assert.notStrictEqual(locSuspect.affinity, locBuiltin.affinity);
+	});
+});
+
+suite('Renderer-safe gate env reads', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	teardown(() => {
+		_setInternalDiagnosticsEnabledForTests(undefined);
+		_setTrustBucketingEnabledForTests(undefined);
+	});
+
+	test('gates return false (do not throw) when process is undefined (renderer)', () => {
+		_setInternalDiagnosticsEnabledForTests(undefined);
+		_setTrustBucketingEnabledForTests(undefined);
+
+		// Simulate sandboxed workbench: no Node `process` binding.
+		const rendererEnv = readOptionalProcessEnv(undefined);
+		assert.deepStrictEqual(rendererEnv, {});
+
+		assert.doesNotThrow(() => {
+			assert.strictEqual(
+				isInternalDiagnosticsEnabled({ productEnabled: false, env: rendererEnv }),
+				false,
+			);
+			assert.strictEqual(
+				isTrustBucketingEnabled({ productEnabled: false, env: rendererEnv }),
+				false,
+			);
+			assert.strictEqual(isDiagnosticIsolationDemoEnvEnabled(rendererEnv), false);
+		});
+	});
+
+	test('gates still honor product + env flags when set', () => {
+		_setInternalDiagnosticsEnabledForTests(undefined);
+		_setTrustBucketingEnabledForTests(undefined);
+
+		const noProcess = readOptionalProcessEnv(undefined);
+		assert.strictEqual(
+			isInternalDiagnosticsEnabled({ productEnabled: true, env: noProcess }),
+			true,
+			'product.json / IProductService path enables without process',
+		);
+		assert.strictEqual(
+			isTrustBucketingEnabled({ productEnabled: true, env: noProcess }),
+			true,
+			'product.json / IProductService path enables without process',
+		);
+
+		assert.strictEqual(
+			isInternalDiagnosticsEnabled({
+				productEnabled: false,
+				env: { [INTERNAL_DIAGNOSTICS_ENV]: '1' },
+			}),
+			true,
+		);
+		assert.strictEqual(
+			isTrustBucketingEnabled({
+				productEnabled: false,
+				env: { [TRUST_BUCKETING_ENV]: 'true' },
+			}),
+			true,
+		);
 	});
 });

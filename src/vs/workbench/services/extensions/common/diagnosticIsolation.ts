@@ -36,6 +36,9 @@
  */
 
 import product from '../../../../platform/product/common/product.js';
+import { readOptionalProcessEnv } from './rendererSafeEnv.js';
+
+export { readOptionalProcessEnv } from './rendererSafeEnv.js';
 
 /** DEMO-ONLY seed id. Used only when the demo flag is explicitly ON. */
 export const DIAGNOSTIC_ISOLATION_DEMO_SEED_ID = 'interview-toybox.desk-gnome';
@@ -90,9 +93,11 @@ function envFlagEnabled(raw: string | undefined): boolean {
  * and later debug telemetry probes). Default OFF.
  *
  * Enabled when any of:
- * - env `VSCODE_INTERNAL_DIAGNOSTICS=1` / `true`
- * - product.json `internalDiagnosticsEnabled: true`
+ * - env `VSCODE_INTERNAL_DIAGNOSTICS=1` / `true` (Node / test harness only)
+ * - product.json `internalDiagnosticsEnabled: true` (renderer-safe via product accessor)
  * - test override via {@link _setInternalDiagnosticsEnabledForTests}
+ *
+ * Never throws when `process` is undefined (sandboxed workbench).
  */
 export function isInternalDiagnosticsEnabled(options: {
 	productEnabled?: boolean;
@@ -101,7 +106,7 @@ export function isInternalDiagnosticsEnabled(options: {
 	if (_internalDiagnosticsEnabledForTests !== undefined) {
 		return _internalDiagnosticsEnabledForTests;
 	}
-	const env = options.env ?? process.env;
+	const env = options.env ?? readOptionalProcessEnv();
 	if (envFlagEnabled(env[INTERNAL_DIAGNOSTICS_ENV])) {
 		return true;
 	}
@@ -171,8 +176,8 @@ export function _resetDiagnosticIsolationForTests(): void {
 	_diagnosticIsolationSet.clear();
 }
 
-export function isDiagnosticIsolationDemoEnvEnabled(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): boolean {
-	return envFlagEnabled(env[DIAGNOSTIC_ISOLATION_DEMO_ENV]);
+export function isDiagnosticIsolationDemoEnvEnabled(env?: NodeJS.ProcessEnv | Record<string, string | undefined>): boolean {
+	return envFlagEnabled((env ?? readOptionalProcessEnv())[DIAGNOSTIC_ISOLATION_DEMO_ENV]);
 }
 
 /**
