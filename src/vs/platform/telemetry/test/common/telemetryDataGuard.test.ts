@@ -409,6 +409,36 @@ suite('TelemetryDataGuard', () => {
 		}
 	});
 
+	test('sr2 FP regressions: first-party events/properties must NOT be blocked', () => {
+		// Explicit checklist from u28v / redo-notes: these shipped shapes were FP1/FP2.
+		const cases: Array<{ label: string; data: unknown; eventName: string }> = [
+			{ label: 'api/scm/createSourceControl', data: { extensionId: 'vscode.git' }, eventName: 'api/scm/createSourceControl' },
+			{
+				label: 'settingsEditor.settingModified',
+				data: { key: 'editor.fontSize', value: 14, source: true },
+				eventName: 'settingsEditor.settingModified',
+			},
+			{ label: 'bare key property', data: { key: 'editor.fontFamily' }, eventName: 'settingsEditor.settingModified' },
+			{ label: 'sourceKey', data: { sourceKey: 'editor.fontSize' }, eventName: 'editTelemetry.apply' },
+			{ label: 'reconnectionToken', data: { reconnectionToken: 'opaque-reconnect-id' }, eventName: 'remote.reconnection' },
+		];
+		for (const c of cases) {
+			const ehA = detectTelemetryUserData(c.data, {
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+				eventName: c.eventName,
+			});
+			const core = detectTelemetryUserData(c.data, { eventName: c.eventName });
+			assert.strictEqual(ehA.hit, false, `ehA falsely blocked ${c.label}`);
+			assert.strictEqual(core.hit, false, `core falsely blocked ${c.label}`);
+			assert.strictEqual(
+				redactTelemetryGuardEventName(c.eventName),
+				c.eventName,
+				`event-name redaction FP on ${c.label}`,
+			);
+		}
+	});
+
 	test('sr2 FP5: scrub preserves JS stack / node:internal / dylib frames', () => {
 		const lines = [
 			'at Object.activate (out/vs/workbench/api/node/extHostExtensionService.js:112:9)',
