@@ -57,7 +57,8 @@ function makeRecordingTelemetry(): ITelemetryService & { events: { name: string;
 	return svc;
 }
 
-function activeProbe(overrides: Partial<Parameters<typeof defineDebugProbe>[0]> = {}) {
+function activeProbe() {
+	// `as const` keeps probeId a string literal (defineDebugProbe rejects widened `string`).
 	return defineDebugProbe({
 		probeId: 'dbg-4711-exthost-rss-spike',
 		owner: 'agent:u33',
@@ -73,7 +74,6 @@ function activeProbe(overrides: Partial<Parameters<typeof defineDebugProbe>[0]> 
 			rssMb: { classification: 'SystemMetaData', purpose: 'PerformanceAndHealth', comment: 'RSS', isMeasurement: true },
 			bucket: { classification: 'SystemMetaData', purpose: 'PerformanceAndHealth', comment: 'bucket' },
 		},
-		...overrides,
 	} as const);
 }
 
@@ -157,11 +157,22 @@ suite('DebugProbes', () => {
 
 	test('expired probe (ttl elapsed) does not emit', () => {
 		const svc = makeRecordingTelemetry();
-		const probe = activeProbe({
+		const probe = defineDebugProbe({
+			probeId: 'dbg-4711-exthost-rss-spike',
+			owner: 'agent:u33',
 			createdAt: '2026-01-01',
+			issueRef: 'anyarchive#4711',
+			issue: 'anyarchive#4711',
 			ttlDays: 30,
 			expiresAt: '2026-01-31',
-		});
+			comment: 'unit-test probe',
+			gdpr: {
+				owner: 'agent:u33',
+				comment: 'test',
+				rssMb: { classification: 'SystemMetaData', purpose: 'PerformanceAndHealth', comment: 'RSS', isMeasurement: true },
+				bucket: { classification: 'SystemMetaData', purpose: 'PerformanceAndHealth', comment: 'bucket' },
+			},
+		} as const);
 		assert.strictEqual(isDebugProbeExpired(probe, Date.parse('2026-02-01')), true);
 
 		setDebugProbeNowMs(() => Date.parse('2026-08-10T12:00:00.000Z'));
@@ -178,7 +189,7 @@ suite('DebugProbes', () => {
 			ttlDays: DEBUG_PROBE_MAX_TTL_DAYS + 1,
 			comment: 'too long',
 			gdpr: { owner: 'agent:u33', comment: 'x' },
-		}), /exceeds max/);
+		} as const), /exceeds max/);
 	});
 
 	test('enumerate script lists probes with owner/expiry/status', () => {

@@ -262,7 +262,7 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 		});
 
 		const commands = this._instaService.invokeFunction(accessor => accessor.get(IExtHostCommands));
-		this._store.add(commands.registerCommand(true, HEAP_DIAGNOSIS_EH_COMMAND_ID, async () => {
+		this._store.add(commands.registerCommand(true, HEAP_DIAGNOSIS_EH_COMMAND_ID, async (): Promise<any> => {
 			if (!this._heapDiagnosis) {
 				return { ok: false, reason: 'capture-failed', detail: 'not-initialized' };
 			}

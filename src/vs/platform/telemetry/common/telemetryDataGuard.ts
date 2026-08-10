@@ -685,6 +685,12 @@ function scanStrings(
 	return { hit: false };
 }
 
+function isTelemetryGuardDetectOptions(
+	value: readonly string[] | TelemetryGuardDetectOptions,
+): value is TelemetryGuardDetectOptions {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 /**
  * Detect user data that must not leave via telemetry.
  * Layer order: canary/marker → path → secret → (strict) shape / measurement bounds.
@@ -694,9 +700,10 @@ export function detectTelemetryUserData(
 	markersOrOptions: readonly string[] | TelemetryGuardDetectOptions = [],
 	maybeOptions?: TelemetryGuardDetectOptions,
 ): TelemetryGuardResult {
-	const options: TelemetryGuardDetectOptions = Array.isArray(markersOrOptions)
-		? { ...(maybeOptions ?? {}), markers: markersOrOptions }
-		: markersOrOptions;
+	// Custom predicate: TS's Array.isArray does not eliminate `readonly string[]`.
+	const options: TelemetryGuardDetectOptions = isTelemetryGuardDetectOptions(markersOrOptions)
+		? markersOrOptions
+		: { ...(maybeOptions ?? {}), markers: markersOrOptions };
 	const markers = options.markers ?? [];
 	const strictShape = !!options.strictShape;
 	const boundMeasurements = strictShape || !!options.boundMeasurements;

@@ -38,6 +38,7 @@ import { detectTelemetryUserData } from '../../../../platform/telemetry/common/t
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IWorkbenchEnvironmentService } from '../../environment/common/environmentService.js';
+import { INativeWorkbenchEnvironmentService } from '../../environment/electron-browser/environmentService.js';
 import { EnablementState, IWorkbenchExtensionEnablementService, IWorkbenchExtensionManagementService } from '../../extensionManagement/common/extensionManagement.js';
 import { IWebWorkerExtensionHostDataProvider, IWebWorkerExtensionHostInitData, WebWorkerExtensionHost } from '../browser/webWorkerExtensionHost.js';
 import { AbstractExtensionService, ExtensionHostCrashTracker, IExtensionHostFactory, LocalExtensions, RemoteExtensions, ResolvedExtensions, ResolverExtensions, checkEnabledAndProposedAPI, extensionIsEnabled, isResolverExtension } from '../common/abstractExtensionService.js';
@@ -80,6 +81,7 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 		@IInstantiationService instantiationService: IInstantiationService,
 		@INotificationService notificationService: INotificationService,
 		@IWorkbenchEnvironmentService environmentService: IWorkbenchEnvironmentService,
+		@INativeWorkbenchEnvironmentService private readonly _nativeEnvironmentService: INativeWorkbenchEnvironmentService,
 		@ITelemetryService telemetryService: ITelemetryService,
 		@IWorkbenchExtensionEnablementService extensionEnablementService: IWorkbenchExtensionEnablementService,
 		@IFileService fileService: IFileService,
@@ -313,7 +315,7 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 		const uptimeSec = ctx?.uptimeSec ?? 0;
 		const ts = Date.now();
 		const hostStartedAtMs = uptimeSec > 0 ? ts - uptimeSec * 1000 : 0;
-		const userDataHome = URI.file(this._environmentService.userDataPath);
+		const userDataHome = URI.file(this._nativeEnvironmentService.userDataPath);
 		void this._scanNearHeapSnapshotAndPersist(userDataHome, {
 			ts,
 			code,
@@ -415,7 +417,7 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 
 	private async _flushPendingExtensionHostCrashRecords(): Promise<void> {
 		try {
-			const userDataHome = URI.file(this._environmentService.userDataPath);
+			const userDataHome = URI.file(this._nativeEnvironmentService.userDataPath);
 			const nowMs = Date.now();
 			await flushPendingExtensionHostCrashRecords(
 				this._fileService,

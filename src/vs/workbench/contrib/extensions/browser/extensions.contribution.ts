@@ -55,7 +55,6 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { EnablementState, IExtensionManagementServerService, IPublisherInfo, IWorkbenchExtensionEnablementService, IWorkbenchExtensionManagementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { IExtensionIgnoredRecommendationsService, IExtensionRecommendationsService } from '../../../services/extensionRecommendations/common/extensionRecommendations.js';
 import { IWorkspaceExtensionsConfigService } from '../../../services/extensionRecommendations/common/workspaceExtensionsConfig.js';
-import product from '../../../../platform/product/common/product.js';
 import { addDiagnosticIsolation, getDiagnosticIsolationIds, isInternalDiagnosticsEnabled, removeDiagnosticIsolation } from '../../../services/extensions/common/diagnosticIsolation.js';
 import { HEAP_DIAGNOSIS_COMMAND_ID, HEAP_DIAGNOSIS_EH_COMMAND_ID, refuseHeapDiagnosisCommandIfGatedOff } from '../../../services/extensions/common/extensionHostHeapWiring.js';
 import { EXTENSIONS_SUPPORT_AGENTS_WINDOW } from '../../../services/extensions/common/extensionManifestPropertiesService.js';
