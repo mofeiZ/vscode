@@ -33,8 +33,8 @@ import { IRemoteAuthorityResolverService, RemoteAuthorityResolverError, RemoteAu
 import { IRemoteExtensionsScannerService } from '../../../../platform/remote/common/remoteExtensionsScanner.js';
 import { getRemoteName, isLoopbackHost, parseAuthorityWithPort } from '../../../../platform/remote/common/remoteHosts.js';
 import { updateProxyConfigurationsScope } from '../../../../platform/request/common/request.js';
+import { tryGuardSafeEmit } from '../../../../platform/telemetry/common/guardSafeEmit.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
-import { detectTelemetryUserData } from '../../../../platform/telemetry/common/telemetryDataGuard.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IWorkbenchEnvironmentService } from '../../environment/common/environmentService.js';
@@ -437,17 +437,13 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 
 	/** Pre-check with the Path-A numeric guard; skip emit on hit (no mainThreadTelemetry touch). */
 	private _emitGuardedCrashTelemetry(eventName: string, data: Record<string, unknown>): boolean {
-		const guard = detectTelemetryUserData(data, {
+		const result = tryGuardSafeEmit(this._telemetryService, eventName, data, {
 			boundMeasurements: true,
 			failClosedOnDepthAbort: true,
-			eventName,
+			usePublicLog2: false,
+			onBlocked: (name, guard) => this._logService.warn(`Blocked ${name} telemetry: ${guard.layer}`),
 		});
-		if (guard.hit) {
-			this._logService.warn(`Blocked ${eventName} telemetry: ${guard.layer}`);
-			return false;
-		}
-		this._telemetryService.publicLog(eventName, data);
-		return true;
+		return result.emitted;
 	}
 
 	// --- impl
