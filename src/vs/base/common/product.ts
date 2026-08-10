@@ -295,6 +295,27 @@ export interface IProductConfiguration {
 	readonly internalDiagnosticsEnabled?: boolean;
 
 	/**
+	 * Trust-bucketed two-host split (fork). Default false/absent.
+	 * When true, first-party/builtin LocalProcess extensions stay on affinity 0
+	 * and third-party extensions are placed on a separate host (affinity 1).
+	 * Overridable by env `VSCODE_TRUST_BUCKETING=1`. Land default OFF until
+	 * per-affinity crash containment ships.
+	 */
+	readonly trustBucketingEnabled?: boolean;
+
+	/**
+	 * Optional publisher allowlist treated as first-party for trust bucketing
+	 * (e.g. `cursor`, `anysphere`). Builtins are trusted without this list.
+	 */
+	readonly trustedExtensionBucketPublishers?: readonly string[];
+
+	/**
+	 * Optional exact extension-id allowlist treated as first-party for trust
+	 * bucketing (Cursor-shipped-but-not-builtin extensions).
+	 */
+	readonly trustedExtensionBucketIds?: readonly string[];
+
+	/**
 	 * Maps an extension-contributed setting key to either a full enterprise {@link IPolicy}
 	 * (the setting owns/"parents" the policy — the original syntax) or an
 	 * {@link IExtensionConfigurationPolicyReference} (`{ policyReference: { name } }`), attaching the

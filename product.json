@@ -8,6 +8,8 @@
 	"internalDiagnosticsEnabled": false,
 	"_comment_demoDiagnosticIsolationSeedDeskGnome": "DEMO-ONLY fork flag. Default false. Set true to seed interview-toybox.desk-gnome into the temporary diagnostic-isolation set (extra EH host). Requires internalDiagnosticsEnabled. LAST-RESORT opt-in; never ship enabled.",
 	"demoDiagnosticIsolationSeedDeskGnome": false,
+	"_comment_trustBucketingEnabled": "Trust-bucketed two-host split (fork). Default false. Set true (or VSCODE_TRUST_BUCKETING=1) to place third-party LocalProcess extensions on affinity 1 while builtins/first-party stay on affinity 0. Opt-in until per-affinity crash containment ships.",
+	"trustBucketingEnabled": false,
 	"win32MutexName": "vscodeoss",
 	"licenseName": "MIT",
 	"licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",

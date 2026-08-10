@@ -13,6 +13,7 @@ import { IWorkbenchEnvironmentService } from '../../environment/common/environme
 import {
 	addDiagnosticIsolation,
 	buildDiagnosticIsolationAffinities,
+	DIAGNOSTIC_ISOLATION_AFFINITY,
 	DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY,
 	getDiagnosticIsolationIds,
 	removeDiagnosticIsolation,
@@ -22,6 +23,12 @@ import { ExtensionHostKind, ExtensionRunningPreference, IExtensionHostKindPicker
 import { IExtensionHostManager } from './extensionHostManagers.js';
 import { IExtensionManifestPropertiesService } from './extensionManifestPropertiesService.js';
 import { ExtensionRunningLocation, LocalProcessRunningLocation, LocalWebWorkerRunningLocation, RemoteRunningLocation } from './extensionRunningLocation.js';
+import {
+	buildTrustBucketAffinities,
+	DIAGNOSTIC_ISOLATION_AFFINITY_WITH_TRUST,
+	isTrustBucketingEnabled,
+	resolveTrustBucketPolicyFromProduct,
+} from './extensionTrustBuckets.js';
 import { isProposedApiEnabled } from './extensions.js';
 
 export class ExtensionRunningLocationTracker {
@@ -196,17 +203,37 @@ export class ExtensionRunningLocationTracker {
 		// because we can currently debug a single extension host
 		if (!this._environmentService.isExtensionDevelopment) {
 			// Go through each configured affinity and try to accomodate it.
-			// Diagnostic-isolation policy first (default empty), then user setting —
-			// user wins on the same extension id. Assignments remain per GROUP.
+			// Precedence (low → high): trust-bucket baseline, diagnostic isolation,
+			// user setting. User wins on the same extension id. Assignments remain per GROUP.
 			const userAffinities = this._configurationService.getValue<{ [extensionId: string]: number } | undefined>('extensions.experimental.affinity') || {};
 			const demoSeedDeskGnome = this._configurationService.getValue<boolean>(DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY) === true;
 			const productDemoSeed = product.demoDiagnosticIsolationSeedDeskGnome === true;
-			const policyAffinities = buildDiagnosticIsolationAffinities({
+
+			// Trust bucketing: LocalProcess only, flag-gated (default OFF).
+			const trustEnabled = extensionHostKind === ExtensionHostKind.LocalProcess
+				&& isTrustBucketingEnabled({ productEnabled: product.trustBucketingEnabled === true });
+			let trustAffinities: { [extensionId: string]: number } = {};
+			if (trustEnabled) {
+				const trustResult = buildTrustBucketAffinities(extensions.values(), groups, resolveTrustBucketPolicyFromProduct());
+				trustAffinities = trustResult.affinities;
+				if (trustResult.dilutedTrustedIds.length > 0) {
+					this._logService.info(`Trust bucketing: diluting trusted extension(s) into the third-party host: ${trustResult.dilutedTrustedIds.join(', ')}`);
+				}
+			}
+
+			const rawDiagnosticAffinities = buildDiagnosticIsolationAffinities({
 				demoSeedDeskGnome,
 				productDemoSeed,
 				productInternalDiagnostics: product.internalDiagnosticsEnabled === true,
 			});
-			const configuredAffinities: { [extensionId: string]: number } = { ...policyAffinities, ...userAffinities };
+			// Avoid colliding with the third-party trust bucket (configured affinity 1).
+			const diagnosticConfiguredAffinity = trustEnabled ? DIAGNOSTIC_ISOLATION_AFFINITY_WITH_TRUST : DIAGNOSTIC_ISOLATION_AFFINITY;
+			const policyAffinities: { [extensionId: string]: number } = {};
+			for (const id of Object.keys(rawDiagnosticAffinities)) {
+				policyAffinities[id] = diagnosticConfiguredAffinity;
+			}
+
+			const configuredAffinities: { [extensionId: string]: number } = { ...trustAffinities, ...policyAffinities, ...userAffinities };
 			const configuredExtensionIds = Object.keys(configuredAffinities);
 			const configuredAffinityToResultingAffinity = new Map<number, number>();
 			for (const extensionId of configuredExtensionIds) {
