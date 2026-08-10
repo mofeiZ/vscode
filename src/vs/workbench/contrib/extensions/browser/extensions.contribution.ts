@@ -55,6 +55,7 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { EnablementState, IExtensionManagementServerService, IPublisherInfo, IWorkbenchExtensionEnablementService, IWorkbenchExtensionManagementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { IExtensionIgnoredRecommendationsService, IExtensionRecommendationsService } from '../../../services/extensionRecommendations/common/extensionRecommendations.js';
 import { IWorkspaceExtensionsConfigService } from '../../../services/extensionRecommendations/common/workspaceExtensionsConfig.js';
+import { addDiagnosticIsolation, getDiagnosticIsolationIds, removeDiagnosticIsolation } from '../../../services/extensions/common/diagnosticIsolation.js';
 import { EXTENSIONS_SUPPORT_AGENTS_WINDOW } from '../../../services/extensions/common/extensionManifestPropertiesService.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
@@ -283,6 +284,18 @@ Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration)
 					}
 				}]
 			},
+			/**
+			 * DEMO-ONLY (fork). Default OFF. Seeds interview-toybox.desk-gnome into the
+			 * temporary diagnostic-isolation set so the 2-host affinity proof can
+			 * reproduce on demand. LAST-RESORT opt-in — each isolated extension costs
+			 * an extra LocalProcess host (memory + CPU + IPC). Prefer the runtime
+			 * add/remove API for real signals (memory-threshold / debug-probe).
+			 */
+			'extensions.diagnosticIsolation.demoSeedDeskGnome': {
+				type: 'boolean',
+				default: false,
+				markdownDescription: localize('extensions.diagnosticIsolation.demoSeedDeskGnome', "**DEMO-ONLY.** When enabled, temporarily isolates `interview-toybox.desk-gnome` onto its own extension host for the 2-host affinity proof. Default off. Reload the window after changing. Do not leave enabled — per-extension isolation is a last-resort diagnostic measure."),
+			},
 			[WORKSPACE_TRUST_EXTENSION_SUPPORT]: {
 				type: 'object',
 				scope: ConfigurationScope.APPLICATION,
@@ -387,6 +400,35 @@ CommandsRegistry.registerCommand('_extensions.manage', (accessor: ServicesAccess
 	} else {
 		throw new Error(localize('notFound', "Extension '{0}' not found.", extensionId));
 	}
+});
+
+/**
+ * Diagnostic isolation add/remove hooks (fork).
+ * Callers: EH memory sampler (u30), debug-telemetry skill.
+ * Placement/restore requires window reload (or future targeted EH restart) —
+ * see diagnosticIsolation.ts module doc. Live restart is NOT wired here.
+ */
+CommandsRegistry.registerCommand({
+	id: '_extensions.diagnosticIsolation.add',
+	handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
+		if (typeof extensionId !== 'string' || !extensionId.trim()) {
+			throw new Error('extensionId (string) is required');
+		}
+		return addDiagnosticIsolation(extensionId);
+	}
+});
+CommandsRegistry.registerCommand({
+	id: '_extensions.diagnosticIsolation.remove',
+	handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
+		if (typeof extensionId !== 'string' || !extensionId.trim()) {
+			throw new Error('extensionId (string) is required');
+		}
+		return removeDiagnosticIsolation(extensionId);
+	}
+});
+CommandsRegistry.registerCommand({
+	id: '_extensions.diagnosticIsolation.list',
+	handler: (): readonly string[] => getDiagnosticIsolationIds()
 });
 
 CommandsRegistry.registerCommand('extension.open', async (accessor: ServicesAccessor, extensionId: string, tab?: ExtensionEditorTab, preserveFocus?: boolean, feature?: string, sideByside?: boolean) => {
