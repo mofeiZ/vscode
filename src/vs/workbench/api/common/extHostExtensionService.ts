@@ -16,6 +16,7 @@ import { ExtHostExtensionServiceShape, MainContext, MainThreadExtensionServiceSh
 import { IExtensionDescriptionDelta, IExtensionHostInitData } from '../../services/extensions/common/extensionHostProtocol.js';
 import { ExtHostConfiguration, IExtHostConfiguration } from './extHostConfiguration.js';
 import { ActivatedExtension, EmptyExtension, ExtensionActivationTimes, ExtensionActivationTimesBuilder, ExtensionsActivator, IExtensionAPI, IExtensionModule, HostExtension, ExtensionActivationTimesFragment } from './extHostExtensionActivator.js';
+import { ensureActiveLongTaskMonitor } from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
 import { ExtHostStorage, IExtHostStorage } from './extHostStorage.js';
 import { ExtHostWorkspace, IExtHostWorkspace } from './extHostWorkspace.js';
 import { MissingExtensionDependency, ActivationKind, checkProposedApiEnabled, isProposedApiEnabled, ExtensionActivationReason, IProposedApiUsage, setProposedApiUsageReporter, setEnabledApiProposalsFallbackExperiment } from '../../services/extensions/common/extensions.js';
@@ -616,7 +617,11 @@ export abstract class AbstractExtHostExtensionService extends Disposable impleme
 			try {
 				activationTimesBuilder.activateCallStart();
 				logService.trace(`ExtensionService#_callActivateOptional ${extensionId.value}`);
-				const activateResult: Promise<IExtensionAPI> = extensionModule.activate.apply(globalThis, [context]);
+				const activateResult: Promise<IExtensionAPI> = ensureActiveLongTaskMonitor().measureSync(
+					'activation',
+					extensionId.value,
+					() => extensionModule.activate!.apply(globalThis, [context]),
+				);
 				activationTimesBuilder.activateCallStop();
 
 				activationTimesBuilder.activateResolveStart();
