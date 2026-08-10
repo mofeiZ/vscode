@@ -28,6 +28,11 @@ export interface IExtensionHostStarter {
 	onDynamicStderr(id: string): Event<string>;
 	onDynamicMessage(id: string): Event<unknown>;
 	onDynamicExit(id: string): Event<{ code: number; signal: string }>;
+	/**
+	 * Electron `child-process-gone` reason for this utility-process EH
+	 * (`oom` | `crashed` | …). May fire before or after `onDynamicExit`.
+	 */
+	onDynamicCrash(id: string): Event<{ code: number; reason: string }>;
 
 	createExtensionHost(): Promise<{ id: string }>;
 	start(id: string, opts: IExtensionHostProcessOptions): Promise<{ pid: number | undefined }>;

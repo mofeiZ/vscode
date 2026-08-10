@@ -69,6 +69,11 @@ export class ExtensionHostStarter extends Disposable implements IDisposable, IEx
 		return this._getExtHost(id).onExit;
 	}
 
+	onDynamicCrash(id: string): Event<{ code: number; reason: string }> {
+		// WindowUtilityProcess.onCrash also carries pid; structural match is enough for ProxyChannel.
+		return this._getExtHost(id).onCrash;
+	}
+
 	async createExtensionHost(): Promise<{ id: string }> {
 		if (this._shutdown) {
 			throw canceled();
