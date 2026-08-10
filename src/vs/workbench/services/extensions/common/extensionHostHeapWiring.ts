@@ -4,18 +4,23 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Leak-diagnosis wiring (u41 / r11 u38-deferred): detect → attribute → diagnose.
+ * Leak-diagnosis wiring (u41 / u43): detect → attribute → diagnose.
  *
- * Pure/testable orchestration + helpers. Capture I/O stays in
- * `extensionHostHeapCapture.ts`; analysis in `extensionHostHeapDiagnosis.ts`.
- * Raw snapshots stay local; only {@link ExtHostHeapAttributionSafeSummary}
- * crosses the guarded first-party pipe.
+ * Two lanes (r16):
+ * - Tier-0 ATTRIBUTION: always-on allocation sampling → guard-safe
+ *   `exthostHeapAttribution`. NOT gated by internal-diagnostics.
+ * - Tier-1 SNAPSHOT: raw `.heapsnapshot` pair + local named report. Gated
+ *   behind internal-diagnostics; never telemetered.
+ *
+ * Capture I/O stays in `extensionHostHeapCapture.ts`; analysis in
+ * `extensionHostHeapDiagnosis.ts`.
  */
 
 import { join } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
 import { bucketRssMb } from './extensionHostMemoryMonitor.js';
 import {
+	analyzeSamplingAttribution,
 	assertSafeSummaryShape,
 	attributeSamplingProfile,
 	buildSafeSummary,
@@ -30,14 +35,17 @@ import {
 	type HeapDiagnosisLocalReport,
 } from './extensionHostHeapDiagnosis.js';
 
-/** Min wall time between automatic capture pairs (r11). */
+/** Min wall time between automatic Tier-1 snapshot pairs (r11). */
 export const HEAP_CAPTURE_COOLDOWN_MS = 30 * 60_000;
 
-/** Max automatic pairs per EH session (r11). */
+/** Max automatic Tier-1 pairs per EH session (r11). */
 export const HEAP_CAPTURE_MAX_PAIRS_PER_SESSION = 2;
 
 /** Default delay between baseline and current snapshots on alert (r11). */
 export const HEAP_PAIR_DELAY_MS = 5 * 60_000;
+
+/** Min wall time between Tier-0 attribution emissions (alert or cadence). */
+export const HEAP_ATTRIBUTION_COOLDOWN_MS = 5 * 60_000;
 
 /** Public on-demand command (renderer): gate-checks, then delegates to the EH. */
 export const HEAP_DIAGNOSIS_COMMAND_ID = '_extensions.heapDiagnosis.captureAndDiagnose';
@@ -50,6 +58,11 @@ export type HeapCaptureSkipReason =
 	| 'max-pairs'
 	| 'in-flight';
 
+export type HeapAttributionSkipReason =
+	| 'cooldown'
+	| 'in-flight'
+	| 'not-started';
+
 export interface HeapCaptureRateLimitState {
 	/** Earliest wall time another automatic pair may start. */
 	nextAllowedMs: number;
@@ -59,10 +72,22 @@ export interface HeapCaptureRateLimitState {
 	inFlight: boolean;
 }
 
+export interface HeapAttributionRateLimitState {
+	nextAllowedMs: number;
+	inFlight: boolean;
+}
+
 export function createHeapCaptureRateLimitState(): HeapCaptureRateLimitState {
 	return {
 		nextAllowedMs: 0,
 		pairsThisSession: 0,
+		inFlight: false,
+	};
+}
+
+export function createHeapAttributionRateLimitState(): HeapAttributionRateLimitState {
+	return {
+		nextAllowedMs: 0,
 		inFlight: false,
 	};
 }
@@ -89,6 +114,23 @@ export function decideAutomaticHeapCapture(
 	};
 }
 
+/** Tier-0 attribution decision — never consults the internal-diagnostics gate. */
+export function decideTier0Attribution(
+	state: HeapAttributionRateLimitState,
+	args: { readonly nowMs: number },
+): { readonly allow: true; readonly nextState: HeapAttributionRateLimitState } | { readonly allow: false; readonly reason: HeapAttributionSkipReason; readonly nextState: HeapAttributionRateLimitState } {
+	if (state.inFlight) {
+		return { allow: false, reason: 'in-flight', nextState: state };
+	}
+	if (args.nowMs < state.nextAllowedMs) {
+		return { allow: false, reason: 'cooldown', nextState: state };
+	}
+	return {
+		allow: true,
+		nextState: { ...state, inFlight: true },
+	};
+}
+
 export function markHeapCaptureFinished(
 	state: HeapCaptureRateLimitState,
 	args: { readonly nowMs: number; readonly succeeded: boolean; readonly countTowardSessionLimit: boolean },
@@ -98,6 +140,16 @@ export function markHeapCaptureFinished(
 		pairsThisSession: args.countTowardSessionLimit && args.succeeded
 			? state.pairsThisSession + 1
 			: state.pairsThisSession,
+		inFlight: false,
+	};
+}
+
+export function markTier0AttributionFinished(
+	state: HeapAttributionRateLimitState,
+	args: { readonly nowMs: number; readonly succeeded: boolean },
+): HeapAttributionRateLimitState {
+	return {
+		nextAllowedMs: args.succeeded ? args.nowMs + HEAP_ATTRIBUTION_COOLDOWN_MS : state.nextAllowedMs,
 		inFlight: false,
 	};
 }
@@ -168,8 +220,8 @@ export type HeapDiagnosisCommandResult =
 	| { readonly ok: false; readonly reason: 'internal-diagnostics-disabled' | 'in-flight' | 'capture-failed'; readonly detail?: string };
 
 /**
- * Gate check for the on-demand capture+diagnose command. When the flag is off,
- * refuse without touching the heap.
+ * Gate check for the on-demand Tier-1 capture+diagnose command. When the flag
+ * is off, refuse without touching the heap.
  */
 export function refuseHeapDiagnosisCommandIfGatedOff(gateEnabled: boolean): HeapDiagnosisCommandResult | undefined {
 	if (!gateEnabled) {
@@ -215,7 +267,8 @@ export function analyzeHeapCapturePair(input: HeapDiagnosisAnalyzeInput): HeapDi
 export interface HeapDiagnosisCaptureHooks {
 	readonly writeSnapshot: (path: string) => string;
 	readonly startSampling: (intervalBytes?: number) => Promise<void>;
-	readonly stopAndGetProfile: () => Promise<AllocationSamplingProfile>;
+	/** Non-stopping profile read for Tier-0 continuous sampling. */
+	readonly getSamplingProfile: () => Promise<AllocationSamplingProfile>;
 	readonly extractClassGroupsFromSnapshot: (path: string) => Promise<HeapClassGroupSummary[]>;
 	readonly delay: (ms: number) => Promise<void>;
 	readonly nowMs: () => number;
@@ -228,6 +281,8 @@ export interface HeapDiagnosisCaptureHooks {
 	readonly isGateEnabled: () => boolean;
 	/** Override pair delay (tests use 0). */
 	readonly pairDelayMs?: number;
+	/** Tier-0 continuous sampling interval (bytes). */
+	readonly tier0SamplingIntervalBytes?: number;
 }
 
 export interface HeapDiagnosisRunResult {
@@ -237,22 +292,29 @@ export interface HeapDiagnosisRunResult {
 	readonly currentPath: string;
 }
 
+export interface HeapAlertDispatchResult {
+	readonly attribution: { readonly started: true } | { readonly started: false; readonly reason: HeapAttributionSkipReason };
+	readonly snapshot: { readonly started: true } | { readonly started: false; readonly reason: HeapCaptureSkipReason };
+}
+
 function heapArtifactPath(dir: string, kind: 'baseline' | 'current', pid: number, seq: number): string {
 	const iso = new Date().toISOString().replace(/[:.]/g, '-');
 	return join(dir, `heap-${iso}-${pid}-${seq}-${kind}.heapsnapshot`);
 }
 
 /**
- * Capture a baseline+current snapshot pair (with sampling), analyze, emit the
- * safe summary, and write the local report. Caller owns rate-limit / gate.
+ * Tier-1: capture a baseline+current snapshot pair (sampling already running),
+ * analyze, emit the safe summary, and write the local report.
+ * Caller owns rate-limit / gate. Does not stop continuous sampling.
  */
 export async function runHeapCaptureAndDiagnose(hooks: HeapDiagnosisCaptureHooks, snapshotSeq: number): Promise<HeapDiagnosisRunResult> {
 	const pairDelayMs = hooks.pairDelayMs ?? HEAP_PAIR_DELAY_MS;
+	// Ensure sampling is on for the window; Tier-0 may already have started it.
 	await hooks.startSampling();
 	const baselinePath = hooks.writeSnapshot(heapArtifactPath(hooks.artifactDirFsPath, 'baseline', hooks.pid, snapshotSeq));
 	await hooks.delay(pairDelayMs);
 	const currentPath = hooks.writeSnapshot(heapArtifactPath(hooks.artifactDirFsPath, 'current', hooks.pid, snapshotSeq));
-	const profile = await hooks.stopAndGetProfile();
+	const profile = await hooks.getSamplingProfile();
 	const before = await hooks.extractClassGroupsFromSnapshot(baselinePath);
 	const after = await hooks.extractClassGroupsFromSnapshot(currentPath);
 	const analyzed = analyzeHeapCapturePair({
@@ -274,55 +336,88 @@ export async function runHeapCaptureAndDiagnose(hooks: HeapDiagnosisCaptureHooks
 	};
 }
 
+/** Tier-0: flush the continuous sampler into a guard-safe attribution summary. */
+export async function runTier0SamplingAttribution(
+	hooks: HeapDiagnosisCaptureHooks,
+	attributionSeq: number,
+): Promise<{ readonly summary: ExtHostHeapAttributionSafeSummary; readonly reportMeta: HeapDiagnosisLocalReport }> {
+	await hooks.startSampling(hooks.tier0SamplingIntervalBytes);
+	const profile = await hooks.getSamplingProfile();
+	const analyzed = analyzeSamplingAttribution({
+		profile,
+		extensionLocations: hooks.listExtensionLocations(),
+		affinity: hooks.affinity,
+		pid: hooks.pid,
+		snapshotSeq: attributionSeq,
+	});
+	assertSafeSummaryShape(analyzed.summary);
+	hooks.logLocalReport(analyzed.reportMeta.text);
+	hooks.emitSafeSummary(analyzed.summary);
+	return analyzed;
+}
+
 /**
- * Session coordinator: rate-limited alert trigger + on-demand command path.
+ * Session coordinator: Tier-0 always-on attribution + gated Tier-1 snapshots.
  */
 export class HeapDiagnosisCoordinator {
-	private _state = createHeapCaptureRateLimitState();
+	private _captureState = createHeapCaptureRateLimitState();
+	private _attributionState = createHeapAttributionRateLimitState();
 	private _snapshotSeq = 0;
+	private _attributionSeq = 0;
+	private _continuousStarted = false;
 
 	constructor(private readonly _hooks: HeapDiagnosisCaptureHooks) { }
 
 	get state(): HeapCaptureRateLimitState {
-		return this._state;
+		return this._captureState;
 	}
 
-	/** Alert path: rate-limited + gate-checked. Returns skip reason or starts work. */
-	onMemoryAlert(): { readonly started: true } | { readonly started: false; readonly reason: HeapCaptureSkipReason } {
-		const decision = decideAutomaticHeapCapture(this._state, {
-			nowMs: this._hooks.nowMs(),
-			gateEnabled: this._hooks.isGateEnabled(),
-		});
-		this._state = decision.nextState;
-		if (!decision.allow) {
-			return { started: false, reason: decision.reason };
-		}
-		const seq = ++this._snapshotSeq;
-		void this._run(seq, /*countTowardSessionLimit*/ true);
-		return { started: true };
+	get attributionState(): HeapAttributionRateLimitState {
+		return this._attributionState;
 	}
 
-	/** On-demand command path (still gate-checked; does not consume session pair budget). */
+	/** Start continuous Tier-0 sampling (always-on; not gate-checked). */
+	async startContinuousSampling(): Promise<void> {
+		await this._hooks.startSampling(this._hooks.tier0SamplingIntervalBytes);
+		this._continuousStarted = true;
+	}
+
+	/**
+	 * Alert path: Tier-0 attribution is always attempted (not gated).
+	 * Tier-1 raw snapshot pair runs only when the internal-diagnostics gate is on.
+	 */
+	onMemoryAlert(): HeapAlertDispatchResult {
+		const attribution = this._startTier0Attribution();
+		const snapshot = this._startTier1Snapshot(/*countTowardSessionLimit*/ true);
+		return { attribution, snapshot };
+	}
+
+	/** Low-cadence Tier-0 flush (not gate-checked). */
+	onAttributionCadence(): { readonly started: true } | { readonly started: false; readonly reason: HeapAttributionSkipReason } {
+		return this._startTier0Attribution();
+	}
+
+	/** On-demand Tier-1 command path (still gate-checked; does not consume session pair budget). */
 	async captureAndDiagnoseCommand(): Promise<HeapDiagnosisCommandResult> {
 		const refused = refuseHeapDiagnosisCommandIfGatedOff(this._hooks.isGateEnabled());
 		if (refused) {
 			return refused;
 		}
-		if (this._state.inFlight) {
+		if (this._captureState.inFlight) {
 			return { ok: false, reason: 'in-flight' };
 		}
-		this._state = { ...this._state, inFlight: true };
+		this._captureState = { ...this._captureState, inFlight: true };
 		const seq = ++this._snapshotSeq;
 		try {
 			const result = await runHeapCaptureAndDiagnose(this._hooks, seq);
-			this._state = markHeapCaptureFinished(this._state, {
+			this._captureState = markHeapCaptureFinished(this._captureState, {
 				nowMs: this._hooks.nowMs(),
 				succeeded: true,
 				countTowardSessionLimit: false,
 			});
 			return { ok: true, summary: result.summary };
 		} catch (err) {
-			this._state = markHeapCaptureFinished(this._state, {
+			this._captureState = markHeapCaptureFinished(this._captureState, {
 				nowMs: this._hooks.nowMs(),
 				succeeded: false,
 				countTowardSessionLimit: false,
@@ -335,16 +430,62 @@ export class HeapDiagnosisCoordinator {
 		}
 	}
 
-	private async _run(seq: number, countTowardSessionLimit: boolean): Promise<void> {
+	private _startTier0Attribution(): { readonly started: true } | { readonly started: false; readonly reason: HeapAttributionSkipReason } {
+		if (!this._continuousStarted) {
+			// Best-effort: still allow if startContinuousSampling was skipped in tests
+			// that inject an already-active getSamplingProfile hook.
+		}
+		const decision = decideTier0Attribution(this._attributionState, {
+			nowMs: this._hooks.nowMs(),
+		});
+		this._attributionState = decision.nextState;
+		if (!decision.allow) {
+			return { started: false, reason: decision.reason };
+		}
+		const seq = ++this._attributionSeq;
+		void this._runTier0(seq);
+		return { started: true };
+	}
+
+	private _startTier1Snapshot(countTowardSessionLimit: boolean): { readonly started: true } | { readonly started: false; readonly reason: HeapCaptureSkipReason } {
+		const decision = decideAutomaticHeapCapture(this._captureState, {
+			nowMs: this._hooks.nowMs(),
+			gateEnabled: this._hooks.isGateEnabled(),
+		});
+		this._captureState = decision.nextState;
+		if (!decision.allow) {
+			return { started: false, reason: decision.reason };
+		}
+		const seq = ++this._snapshotSeq;
+		void this._runTier1(seq, countTowardSessionLimit);
+		return { started: true };
+	}
+
+	private async _runTier0(seq: number): Promise<void> {
+		try {
+			await runTier0SamplingAttribution(this._hooks, seq);
+			this._attributionState = markTier0AttributionFinished(this._attributionState, {
+				nowMs: this._hooks.nowMs(),
+				succeeded: true,
+			});
+		} catch {
+			this._attributionState = markTier0AttributionFinished(this._attributionState, {
+				nowMs: this._hooks.nowMs(),
+				succeeded: false,
+			});
+		}
+	}
+
+	private async _runTier1(seq: number, countTowardSessionLimit: boolean): Promise<void> {
 		try {
 			await runHeapCaptureAndDiagnose(this._hooks, seq);
-			this._state = markHeapCaptureFinished(this._state, {
+			this._captureState = markHeapCaptureFinished(this._captureState, {
 				nowMs: this._hooks.nowMs(),
 				succeeded: true,
 				countTowardSessionLimit,
 			});
 		} catch {
-			this._state = markHeapCaptureFinished(this._state, {
+			this._captureState = markHeapCaptureFinished(this._captureState, {
 				nowMs: this._hooks.nowMs(),
 				succeeded: false,
 				countTowardSessionLimit,
