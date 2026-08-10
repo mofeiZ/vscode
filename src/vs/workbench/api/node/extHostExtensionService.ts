@@ -24,6 +24,21 @@ import { assertType } from '../../../base/common/types.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { BidirectionalMap } from '../../../base/common/map.js';
 import { DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
+import { IntervalTimer } from '../../../base/common/async.js';
+import { joinPath } from '../../../base/common/resources.js';
+import { ILogger, ILoggerService } from '../../../platform/log/common/log.js';
+import {
+	buildMemoryAlertTelemetryPayload,
+	buildMemorySample,
+	buildMemoryTelemetryPayload,
+	createMemoryAlertState,
+	decideMemoryAlert,
+	formatMemoryLogLine,
+	MEMORY_SAMPLE_INTERVAL_MS,
+	MemoryAlertState,
+	MemorySampleRing,
+	shouldEmitMemorySampleTelemetry,
+} from '../../services/extensions/common/extensionHostMemoryMonitor.js';
 const require = nodeModule.createRequire(import.meta.url);
 
 class NodeModuleRequireInterceptor extends RequireInterceptor {
@@ -147,6 +162,11 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 
 	readonly extensionRuntime = ExtensionRuntime.Node;
 
+	private _memorySampleSeq = 0;
+	private _memoryAlertState: MemoryAlertState = createMemoryAlertState();
+	private readonly _memorySampleRing = new MemorySampleRing();
+	private _memoryLogger: ILogger | undefined;
+
 	protected async _beforeAlmostReadyToRunExtensions(): Promise<void> {
 		// make sure console.log calls make it to the render
 		this._instaService.createInstance(ExtHostConsoleForwarder);
@@ -179,6 +199,117 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 		const configProvider = await this._extHostConfiguration.getConfigProvider();
 		await connectProxyResolver(this._extHostWorkspace, configProvider, this, this._logService, this._mainThreadTelemetryProxy, this._initData, this._store);
 		performance.mark('code/extHost/didInitProxyResolver');
+
+		// Per-EH memory sampler (numbers/buckets only → guarded Path A + local metrics).
+		this._startExtensionHostMemoryMonitor();
+	}
+
+	private _startExtensionHostMemoryMonitor(): void {
+		const loggerService = this._instaService.invokeFunction(accessor => accessor.get(ILoggerService));
+		this._memoryLogger = this._store.add(loggerService.createLogger(
+			joinPath(this._initData.logsLocation, 'exthost-memory.log'),
+			{
+				id: 'exthostMemory',
+				name: 'Extension Host Memory',
+				logLevel: 'always',
+				hidden: true,
+			}
+		));
+
+		const timer = this._store.add(new IntervalTimer());
+		const takeSample = () => {
+			try {
+				this._takeExtensionHostMemorySample();
+			} catch (err) {
+				this._logService.warn('[exthostMemory] sample failed', err);
+			}
+		};
+		// Baseline immediately, then every ~30s.
+		takeSample();
+		timer.cancelAndSet(takeSample, MEMORY_SAMPLE_INTERVAL_MS);
+	}
+
+	private _takeExtensionHostMemorySample(): void {
+		this._memorySampleSeq++;
+		const sample = buildMemorySample({
+			usage: process.memoryUsage(),
+			uptimeSec: process.uptime(),
+			sampleSeq: this._memorySampleSeq,
+			pid: this._hostUtils.pid ?? process.pid,
+			tsMs: Date.now(),
+			ring: this._memorySampleRing,
+		});
+
+		this._memoryLogger?.info(formatMemoryLogLine(sample, 'SAMPLE'));
+
+		type ExtHostMemorySampleClassification = {
+			owner: 'anyarchive';
+			comment: 'Per-extension-host memory heartbeat (bucketed RSS + heap). Numbers only.';
+			rssBucketMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'RSS bucket edge in MB' };
+			heapUsedMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 heapUsed in MB' };
+			heapTotalMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 heapTotal in MB' };
+			externalMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 external memory in MB' };
+			growthMbPerMin: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'RSS growth rate MB/min over recent samples' };
+			uptimeSec: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Process uptime seconds' };
+			sampleSeq: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Monotonic sample sequence' };
+			pid: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Opaque process id' };
+		};
+		type ExtHostMemorySampleEvent = {
+			rssBucketMb: number;
+			heapUsedMb: number;
+			heapTotalMb: number;
+			externalMb: number;
+			growthMbPerMin: number;
+			uptimeSec: number;
+			sampleSeq: number;
+			pid: number;
+		};
+
+		if (shouldEmitMemorySampleTelemetry(sample.sampleSeq)) {
+			this._mainThreadTelemetryProxy.$publicLog2<ExtHostMemorySampleEvent, ExtHostMemorySampleClassification>(
+				'exthostMemorySample',
+				buildMemoryTelemetryPayload(sample),
+			);
+		}
+
+		const decision = decideMemoryAlert(
+			{ rssBucketMb: sample.rssBucketMb, growthMbPerMin: sample.growthMbPerMin },
+			this._memoryAlertState,
+			{ nowMs: sample.tsMs },
+		);
+		this._memoryAlertState = decision.nextState;
+		if (!decision.fire || !decision.trigger) {
+			return;
+		}
+
+		const alertLine = formatMemoryLogLine(sample, 'ALERT', decision.trigger);
+		this._memoryLogger?.info(alertLine);
+		// Numbers-only breadcrumb in the EH/window log for discoverability (parity with u5 stderr trick).
+		this._logService.warn(`[exthostMemory] ${alertLine}`);
+
+		type ExtHostMemoryAlertClassification = {
+			owner: 'anyarchive';
+			comment: 'Per-extension-host memory alert (level crossing or growth rate). Numbers/enums only.';
+			rssBucketMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'RSS bucket edge in MB' };
+			heapUsedMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 heapUsed in MB' };
+			heapTotalMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 heapTotal in MB' };
+			externalMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'V8 external memory in MB' };
+			growthMbPerMin: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'RSS growth rate MB/min over recent samples' };
+			uptimeSec: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Process uptime seconds' };
+			sampleSeq: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Monotonic sample sequence' };
+			pid: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Opaque process id' };
+			trigger: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; comment: 'level | growth' };
+			thresholdBucketMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Configured level threshold bucket MB' };
+		};
+		type ExtHostMemoryAlertEvent = ExtHostMemorySampleEvent & {
+			trigger: string;
+			thresholdBucketMb: number;
+		};
+
+		this._mainThreadTelemetryProxy.$publicLog2<ExtHostMemoryAlertEvent, ExtHostMemoryAlertClassification>(
+			'exthostMemoryAlert',
+			buildMemoryAlertTelemetryPayload(sample, decision.trigger, decision.thresholdBucketMb ?? 3072),
+		);
 	}
 
 	protected _getEntryPoint(extensionDescription: IExtensionDescription): string | undefined {
