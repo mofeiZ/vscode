@@ -282,8 +282,17 @@ export interface IProductConfiguration {
 	 * `interview-toybox.desk-gnome` into the diagnostic-isolation set so the
 	 * 2-host affinity proof can reproduce on demand. Never enable by default —
 	 * per-extension isolation costs an extra host (memory + CPU + IPC).
+	 * Also requires {@link internalDiagnosticsEnabled} (or env override).
 	 */
 	readonly demoDiagnosticIsolationSeedDeskGnome?: boolean;
+
+	/**
+	 * Tier-1 internal diagnostics gate (fork). Default false/absent.
+	 * When true, enables invasive diagnostic isolation (and future debug
+	 * probes). Overridable by env `VSCODE_INTERNAL_DIAGNOSTICS=1` for test /
+	 * local runs. Never ship enabled for external / enterprise customers.
+	 */
+	readonly internalDiagnosticsEnabled?: boolean;
 
 	/**
 	 * Maps an extension-contributed setting key to either a full enterprise {@link IPolicy}

@@ -55,7 +55,8 @@ import { IEditorService } from '../../../services/editor/common/editorService.js
 import { EnablementState, IExtensionManagementServerService, IPublisherInfo, IWorkbenchExtensionEnablementService, IWorkbenchExtensionManagementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { IExtensionIgnoredRecommendationsService, IExtensionRecommendationsService } from '../../../services/extensionRecommendations/common/extensionRecommendations.js';
 import { IWorkspaceExtensionsConfigService } from '../../../services/extensionRecommendations/common/workspaceExtensionsConfig.js';
-import { addDiagnosticIsolation, getDiagnosticIsolationIds, removeDiagnosticIsolation } from '../../../services/extensions/common/diagnosticIsolation.js';
+import product from '../../../../platform/product/common/product.js';
+import { addDiagnosticIsolation, getDiagnosticIsolationIds, isInternalDiagnosticsEnabled, removeDiagnosticIsolation } from '../../../services/extensions/common/diagnosticIsolation.js';
 import { EXTENSIONS_SUPPORT_AGENTS_WINDOW } from '../../../services/extensions/common/extensionManifestPropertiesService.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
@@ -403,33 +404,42 @@ CommandsRegistry.registerCommand('_extensions.manage', (accessor: ServicesAccess
 });
 
 /**
- * Diagnostic isolation add/remove hooks (fork).
+ * Diagnostic isolation add/remove hooks (fork) — Tier-1, gated.
  * Callers: EH memory sampler (u30), debug-telemetry skill.
  * Placement/restore requires window reload (or future targeted EH restart) —
  * see diagnosticIsolation.ts module doc. Live restart is NOT wired here.
+ *
+ * Registered only when the internal-diagnostics gate is ON
+ * (`product.internalDiagnosticsEnabled` or `VSCODE_INTERNAL_DIAGNOSTICS=1`).
+ * Handlers also re-check the gate so add refuses if the gate flips off.
  */
-CommandsRegistry.registerCommand({
-	id: '_extensions.diagnosticIsolation.add',
-	handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
-		if (typeof extensionId !== 'string' || !extensionId.trim()) {
-			throw new Error('extensionId (string) is required');
+if (isInternalDiagnosticsEnabled({ productEnabled: product.internalDiagnosticsEnabled === true })) {
+	CommandsRegistry.registerCommand({
+		id: '_extensions.diagnosticIsolation.add',
+		handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
+			if (!isInternalDiagnosticsEnabled({ productEnabled: product.internalDiagnosticsEnabled === true })) {
+				return false;
+			}
+			if (typeof extensionId !== 'string' || !extensionId.trim()) {
+				throw new Error('extensionId (string) is required');
+			}
+			return addDiagnosticIsolation(extensionId);
 		}
-		return addDiagnosticIsolation(extensionId);
-	}
-});
-CommandsRegistry.registerCommand({
-	id: '_extensions.diagnosticIsolation.remove',
-	handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
-		if (typeof extensionId !== 'string' || !extensionId.trim()) {
-			throw new Error('extensionId (string) is required');
+	});
+	CommandsRegistry.registerCommand({
+		id: '_extensions.diagnosticIsolation.remove',
+		handler: (_accessor: ServicesAccessor, extensionId: string): boolean => {
+			if (typeof extensionId !== 'string' || !extensionId.trim()) {
+				throw new Error('extensionId (string) is required');
+			}
+			return removeDiagnosticIsolation(extensionId);
 		}
-		return removeDiagnosticIsolation(extensionId);
-	}
-});
-CommandsRegistry.registerCommand({
-	id: '_extensions.diagnosticIsolation.list',
-	handler: (): readonly string[] => getDiagnosticIsolationIds()
-});
+	});
+	CommandsRegistry.registerCommand({
+		id: '_extensions.diagnosticIsolation.list',
+		handler: (): readonly string[] => getDiagnosticIsolationIds()
+	});
+}
 
 CommandsRegistry.registerCommand('extension.open', async (accessor: ServicesAccessor, extensionId: string, tab?: ExtensionEditorTab, preserveFocus?: boolean, feature?: string, sideByside?: boolean) => {
 	const extensionService = accessor.get(IExtensionsWorkbenchService);

@@ -11,9 +11,12 @@ import { ExtensionIdentifier, IExtensionDescription } from '../../../../../platf
 import { NullLogService } from '../../../../../platform/log/common/log.js';
 import {
 	_resetDiagnosticIsolationForTests,
+	_setInternalDiagnosticsEnabledForTests,
 	addDiagnosticIsolation,
 	DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY,
 	DIAGNOSTIC_ISOLATION_DEMO_SEED_ID,
+	getDiagnosticIsolationIds,
+	isInternalDiagnosticsEnabled,
 	removeDiagnosticIsolation,
 } from '../../common/diagnosticIsolation.js';
 import { ExtensionRunningLocationTracker } from '../../common/extensionRunningLocationTracker.js';
@@ -42,8 +45,14 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
 
+	setup(() => {
+		// Existing isolation tests exercise Tier-1 behavior with the gate ON.
+		_setInternalDiagnosticsEnabledForTests(true);
+	});
+
 	teardown(() => {
 		_resetDiagnosticIsolationForTests();
+		_setInternalDiagnosticsEnabledForTests(undefined);
 	});
 
 	function createTracker(
@@ -205,6 +214,60 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		assert.ok(locDesk && locOther);
 		assert.strictEqual(locDesk!.affinity, 0, 'Default-off policy must not isolate desk-gnome');
 		assert.strictEqual(locOther!.affinity, 0);
+	});
+
+	test('internal diagnostics gate OFF refuses add and does not isolate', () => {
+		_setInternalDiagnosticsEnabledForTests(false);
+		assert.strictEqual(isInternalDiagnosticsEnabled(), false);
+
+		const suspect = createExtension('publisher.suspect');
+		const other = createExtension('publisher.other');
+
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), false, 'add refuses when gate OFF');
+		assert.deepStrictEqual(getDiagnosticIsolationIds(), [], 'set stays empty when gate OFF');
+
+		const tracker = createTracker([suspect, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, other], [], true);
+
+		assert.strictEqual(runningLocations.get(suspect.identifier)!.affinity, 0, '_computeAffinity must not isolate when gate OFF');
+		assert.strictEqual(runningLocations.get(other.identifier)!.affinity, 0);
+	});
+
+	test('internal diagnostics gate OFF makes a pre-seeded set inert in _computeAffinity', () => {
+		// Enable briefly to populate the set, then disable — placement must stay inert.
+		_setInternalDiagnosticsEnabledForTests(true);
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), true);
+		_setInternalDiagnosticsEnabledForTests(false);
+
+		const suspect = createExtension('publisher.suspect');
+		const other = createExtension('publisher.other');
+		const tracker = createTracker([suspect, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, other], [], true);
+
+		assert.deepStrictEqual(getDiagnosticIsolationIds(), ['publisher.suspect'], 'set may still hold ids');
+		assert.strictEqual(runningLocations.get(suspect.identifier)!.affinity, 0, 'gate OFF ⇒ affinities empty');
+		assert.strictEqual(runningLocations.get(other.identifier)!.affinity, 0);
+	});
+
+	test('internal diagnostics gate ON allows add and isolates the flagged group', () => {
+		_setInternalDiagnosticsEnabledForTests(true);
+		assert.strictEqual(isInternalDiagnosticsEnabled(), true);
+
+		const suspect = createExtension('publisher.suspect');
+		const other = createExtension('publisher.other');
+
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), true);
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), false, 'idempotent add');
+
+		const tracker = createTracker([suspect, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, other], [], true);
+
+		const locSuspect = runningLocations.get(suspect.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locSuspect && locOther);
+		assert.strictEqual(locSuspect!.affinity, 1, 'Flagged extension lands on its own host');
+		assert.strictEqual(locOther!.affinity, 0, 'Unflagged extensions stay on the shared host');
 	});
 
 	test('diagnostic isolation set places flagged id group on its own affinity', () => {

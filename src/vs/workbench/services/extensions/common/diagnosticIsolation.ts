@@ -11,6 +11,15 @@
  * is turned on. Per-extension isolation costs an extra LocalProcess extension
  * host (memory + CPU + IPC); never enable this by default.
  *
+ * Tier-1 access gate (internal builds / employees only in production):
+ *   product.json `internalDiagnosticsEnabled: true`
+ *   OR env `VSCODE_INTERNAL_DIAGNOSTICS=1`
+ * Default absent/false — when the gate is OFF, add/remove commands and
+ * `addDiagnosticIsolation` refuse/no-op, and `_computeAffinity` never
+ * applies isolation affinities (runtime set and demo seed are inert).
+ * Modeled on the same product.json + env pattern as the DEMO seed below
+ * (`demoDiagnosticIsolationSeedDeskGnome` / `VSCODE_DEMO_DIAGNOSTIC_ISOLATION`).
+ *
  * Intended callers (wire later; this module is the clean interface):
  *   - memory-threshold signal (u30 EH memory sampler) → add on alert, remove on cool
  *   - debug-probe-attached signal (debug-telemetry skill) → add while attached, remove on detach
@@ -25,6 +34,8 @@
  * Group integrity is enforced by the tracker: assignment is per dependency /
  * extensionAffinity group; never split a group.
  */
+
+import product from '../../../../platform/product/common/product.js';
 
 /** DEMO-ONLY seed id. Used only when the demo flag is explicitly ON. */
 export const DIAGNOSTIC_ISOLATION_DEMO_SEED_ID = 'interview-toybox.desk-gnome';
@@ -45,22 +56,77 @@ export const DIAGNOSTIC_ISOLATION_DEMO_PRODUCT_FIELD = 'demoDiagnosticIsolationS
 /** DEMO-ONLY env override: set to `1` / `true` to seed desk-gnome. */
 export const DIAGNOSTIC_ISOLATION_DEMO_ENV = 'VSCODE_DEMO_DIAGNOSTIC_ISOLATION';
 
+/**
+ * Tier-1 internal-diagnostics product.json field (default false / absent).
+ * When true, enables invasive diagnostic isolation (and future debug probes).
+ * Never ship enabled for external / enterprise customers.
+ */
+export const INTERNAL_DIAGNOSTICS_PRODUCT_FIELD = 'internalDiagnosticsEnabled';
+
+/**
+ * Tier-1 internal-diagnostics env override for test / local runs.
+ * Set to `1` / `true` to enable invasive diagnostics without a product rebuild.
+ */
+export const INTERNAL_DIAGNOSTICS_ENV = 'VSCODE_INTERNAL_DIAGNOSTICS';
+
 /** Affinity number requested for diagnostically isolated groups (shared diagnostic host). */
 export const DIAGNOSTIC_ISOLATION_AFFINITY = 1;
 
 const _diagnosticIsolationSet = new Set<string>();
 
+/** Test-only override for the Tier-1 gate (`undefined` = consult product/env). */
+let _internalDiagnosticsEnabledForTests: boolean | undefined;
+
 function normalizeExtensionId(extensionId: string): string {
 	return extensionId.trim();
+}
+
+function envFlagEnabled(raw: string | undefined): boolean {
+	return raw === '1' || raw === 'true';
+}
+
+/**
+ * Single Tier-1 access gate for invasive diagnostics (diagnostic isolation,
+ * and later debug telemetry probes). Default OFF.
+ *
+ * Enabled when any of:
+ * - env `VSCODE_INTERNAL_DIAGNOSTICS=1` / `true`
+ * - product.json `internalDiagnosticsEnabled: true`
+ * - test override via {@link _setInternalDiagnosticsEnabledForTests}
+ */
+export function isInternalDiagnosticsEnabled(options: {
+	productEnabled?: boolean;
+	env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+} = {}): boolean {
+	if (_internalDiagnosticsEnabledForTests !== undefined) {
+		return _internalDiagnosticsEnabledForTests;
+	}
+	const env = options.env ?? process.env;
+	if (envFlagEnabled(env[INTERNAL_DIAGNOSTICS_ENV])) {
+		return true;
+	}
+	const productEnabled = options.productEnabled ?? (product.internalDiagnosticsEnabled === true);
+	return productEnabled === true;
+}
+
+/** Test-only: force the Tier-1 gate on/off. Pass `undefined` to clear. */
+export function _setInternalDiagnosticsEnabledForTests(enabled: boolean | undefined): void {
+	_internalDiagnosticsEnabledForTests = enabled;
 }
 
 /**
  * Add an extension id to the diagnostic-isolation set.
  * Returns true if the id was newly added.
  *
+ * Tier-1 gated: refuses (returns false, does not mutate) when
+ * {@link isInternalDiagnosticsEnabled} is false.
+ *
  * Does not restart hosts by itself — see module doc APPLY / RESTORE.
  */
 export function addDiagnosticIsolation(extensionId: string): boolean {
+	if (!isInternalDiagnosticsEnabled()) {
+		return false;
+	}
 	const id = normalizeExtensionId(extensionId);
 	if (!id) {
 		return false;
@@ -73,6 +139,9 @@ export function addDiagnosticIsolation(extensionId: string): boolean {
 /**
  * Remove an extension id from the diagnostic-isolation set (auto-restore path).
  * Returns true if the id was present.
+ *
+ * Allowed even when the Tier-1 gate is OFF so a previously-enabled session can
+ * clear leftover ids; placement remains inert while the gate is OFF.
  *
  * Does not restart hosts by itself — see module doc APPLY / RESTORE.
  */
@@ -97,25 +166,34 @@ export function clearDiagnosticIsolation(): void {
 	_diagnosticIsolationSet.clear();
 }
 
-/** Test-only reset of the runtime set. */
+/** Test-only reset of the runtime set (does not clear the gate override). */
 export function _resetDiagnosticIsolationForTests(): void {
 	_diagnosticIsolationSet.clear();
 }
 
 export function isDiagnosticIsolationDemoEnvEnabled(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): boolean {
-	const raw = env[DIAGNOSTIC_ISOLATION_DEMO_ENV];
-	return raw === '1' || raw === 'true';
+	return envFlagEnabled(env[DIAGNOSTIC_ISOLATION_DEMO_ENV]);
 }
 
 /**
  * Build the affinity policy map consumed by `_computeAffinity`.
  * Empty by default. Demo seed is opt-in via options / config / product / env.
+ *
+ * Tier-1 gated: returns `{}` when {@link isInternalDiagnosticsEnabled} is false,
+ * so runtime set contents and demo seed are inert in production.
  */
 export function buildDiagnosticIsolationAffinities(options: {
 	demoSeedDeskGnome?: boolean;
 	productDemoSeed?: boolean;
 	env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+	productInternalDiagnostics?: boolean;
 } = {}): { [extensionId: string]: number } {
+	if (!isInternalDiagnosticsEnabled({
+		productEnabled: options.productInternalDiagnostics,
+		env: options.env,
+	})) {
+		return {};
+	}
 	const ids = new Set(_diagnosticIsolationSet);
 	const demoOn = Boolean(options.demoSeedDeskGnome)
 		|| Boolean(options.productDemoSeed)
