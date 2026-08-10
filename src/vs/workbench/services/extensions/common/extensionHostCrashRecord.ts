@@ -8,6 +8,7 @@ import { joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
 import { flushActiveFlightRecorderInto } from '../../../../platform/telemetry/common/flightRecorder.js';
 import { ExtensionHostExitCode } from './extensionHostProtocol.js';
+import { flushActiveWorkspaceActionsInto } from './workspaceActionsRing.js';
 
 /**
  * Durable, numbers-only crash records for local extension hosts.
@@ -212,6 +213,8 @@ export function crashRecordTelemetryData(record: ExtensionHostCrashRecord, extra
 	}
 	// u45: attach active flight-recorder ring when registered (no-op otherwise).
 	flushActiveFlightRecorderInto(data);
+	// R4b / r17 Lane A: attach workspace-actions ring + shape (no-op otherwise).
+	flushActiveWorkspaceActionsInto(data);
 	return data;
 }
 
