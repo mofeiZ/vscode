@@ -11,6 +11,7 @@
  */
 
 import { flushActiveFlightRecorderInto } from '../../../../platform/telemetry/common/flightRecorder.js';
+import { flushActiveWorkspaceActionsInto } from './workspaceActionsRing.js';
 
 /** Fixed RSS bucket edges in MB (telemetry reports the highest edge ≤ RSS). */
 export const RSS_BUCKET_EDGES_MB: readonly number[] = [128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192];
@@ -254,6 +255,8 @@ export function buildMemoryAlertDiagnosticPayload(
 		...buildMemoryAlertTelemetryPayload(sample, trigger, thresholdBucketMb),
 	};
 	flushActiveFlightRecorderInto(data);
+	// R4b / r17 Lane A: attach workspace-actions ring + shape (no-op otherwise).
+	flushActiveWorkspaceActionsInto(data);
 	return data;
 }
 
