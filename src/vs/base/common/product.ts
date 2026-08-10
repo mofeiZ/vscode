@@ -278,6 +278,14 @@ export interface IProductConfiguration {
 	readonly remoteDefaultExtensionsIfInstalledLocally?: string[];
 
 	/**
+	 * DEMO-ONLY (fork). Default false/absent. When true, seeds
+	 * `interview-toybox.desk-gnome` into the diagnostic-isolation set so the
+	 * 2-host affinity proof can reproduce on demand. Never enable by default —
+	 * per-extension isolation costs an extra host (memory + CPU + IPC).
+	 */
+	readonly demoDiagnosticIsolationSeedDeskGnome?: boolean;
+
+	/**
 	 * Maps an extension-contributed setting key to either a full enterprise {@link IPolicy}
 	 * (the setting owns/"parents" the policy — the original syntax) or an
 	 * {@link IExtensionConfigurationPolicyReference} (`{ policyReference: { name } }`), attaching the

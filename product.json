@@ -4,6 +4,8 @@
 	"applicationName": "code-oss",
 	"dataFolderName": ".vscode-oss",
 	"sharedDataFolderName": ".vscode-oss-shared",
+	"_comment_demoDiagnosticIsolationSeedDeskGnome": "DEMO-ONLY fork flag. Default false. Set true to seed interview-toybox.desk-gnome into the temporary diagnostic-isolation set (extra EH host). LAST-RESORT opt-in; never ship enabled.",
+	"demoDiagnosticIsolationSeedDeskGnome": false,
 	"win32MutexName": "vscodeoss",
 	"licenseName": "MIT",
 	"licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",

@@ -4,30 +4,25 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Schemas } from '../../../../base/common/network.js';
+import product from '../../../../platform/product/common/product.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ExtensionKind } from '../../../../platform/environment/common/environment.js';
 import { ExtensionIdentifier, ExtensionIdentifierMap, IExtensionDescription } from '../../../../platform/extensions/common/extensions.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { IWorkbenchEnvironmentService } from '../../environment/common/environmentService.js';
+import {
+	addDiagnosticIsolation,
+	buildDiagnosticIsolationAffinities,
+	DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY,
+	getDiagnosticIsolationIds,
+	removeDiagnosticIsolation,
+} from './diagnosticIsolation.js';
 import { IReadOnlyExtensionDescriptionRegistry } from './extensionDescriptionRegistry.js';
 import { ExtensionHostKind, ExtensionRunningPreference, IExtensionHostKindPicker, determineExtensionHostKinds } from './extensionHostKind.js';
 import { IExtensionHostManager } from './extensionHostManagers.js';
 import { IExtensionManifestPropertiesService } from './extensionManifestPropertiesService.js';
 import { ExtensionRunningLocation, LocalProcessRunningLocation, LocalWebWorkerRunningLocation, RemoteRunningLocation } from './extensionRunningLocation.js';
 import { isProposedApiEnabled } from './extensions.js';
-
-/**
- * Affinity policy seam (fork): automatic LocalProcess affinities for designated
- * extensions. Upstream only ever reads `extensions.experimental.affinity`; this
- * map is the missing policy source. Assignments are merged into the same
- * accommodation loop as the user setting (user wins on conflict) and therefore
- * still run per dependency/`extensionAffinity` GROUP — never host-per-extension.
- * Interview scope: isolate Desk Gnome. Affinity 0 remains the default for all
- * other extensions. Skipped under extension development (same as the setting).
- */
-const EXTENSION_AFFINITY_POLICY: Readonly<{ [extensionId: string]: number }> = Object.freeze({
-	'interview-toybox.desk-gnome': 1,
-});
 
 export class ExtensionRunningLocationTracker {
 
@@ -51,6 +46,30 @@ export class ExtensionRunningLocationTracker {
 		@ILogService private readonly _logService: ILogService,
 		@IExtensionManifestPropertiesService private readonly _extensionManifestPropertiesService: IExtensionManifestPropertiesService,
 	) { }
+
+	/**
+	 * Flag an extension for temporary diagnostic isolation (own LocalProcess host).
+	 * Hook for memory-sampler / debug-telemetry callers. Does not restart hosts;
+	 * reload (or future targeted EH restart) is required for placement to apply.
+	 * @returns true if the id was newly added
+	 */
+	public addDiagnosticIsolation(extensionId: string): boolean {
+		return addDiagnosticIsolation(extensionId);
+	}
+
+	/**
+	 * Clear diagnostic isolation for an extension (auto-restore to shared host).
+	 * Reload (or future targeted EH restart) is required for restore to apply.
+	 * @returns true if the id was present
+	 */
+	public removeDiagnosticIsolation(extensionId: string): boolean {
+		return removeDiagnosticIsolation(extensionId);
+	}
+
+	/** Runtime diagnostic-isolation ids (excludes demo seed). */
+	public getDiagnosticIsolationIds(): readonly string[] {
+		return getDiagnosticIsolationIds();
+	}
 
 	public set(extensionId: ExtensionIdentifier, runningLocation: ExtensionRunningLocation) {
 		this._runningLocation.set(extensionId, runningLocation);
@@ -177,9 +196,13 @@ export class ExtensionRunningLocationTracker {
 		// because we can currently debug a single extension host
 		if (!this._environmentService.isExtensionDevelopment) {
 			// Go through each configured affinity and try to accomodate it.
-			// Policy first, then user setting — user wins on the same extension id.
+			// Diagnostic-isolation policy first (default empty), then user setting —
+			// user wins on the same extension id. Assignments remain per GROUP.
 			const userAffinities = this._configurationService.getValue<{ [extensionId: string]: number } | undefined>('extensions.experimental.affinity') || {};
-			const configuredAffinities: { [extensionId: string]: number } = { ...EXTENSION_AFFINITY_POLICY, ...userAffinities };
+			const demoSeedDeskGnome = this._configurationService.getValue<boolean>(DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY) === true;
+			const productDemoSeed = product.demoDiagnosticIsolationSeedDeskGnome === true;
+			const policyAffinities = buildDiagnosticIsolationAffinities({ demoSeedDeskGnome, productDemoSeed });
+			const configuredAffinities: { [extensionId: string]: number } = { ...policyAffinities, ...userAffinities };
 			const configuredExtensionIds = Object.keys(configuredAffinities);
 			const configuredAffinityToResultingAffinity = new Map<number, number>();
 			for (const extensionId of configuredExtensionIds) {

@@ -9,6 +9,13 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/tes
 import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { ExtensionIdentifier, IExtensionDescription } from '../../../../../platform/extensions/common/extensions.js';
 import { NullLogService } from '../../../../../platform/log/common/log.js';
+import {
+	_resetDiagnosticIsolationForTests,
+	addDiagnosticIsolation,
+	DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY,
+	DIAGNOSTIC_ISOLATION_DEMO_SEED_ID,
+	removeDiagnosticIsolation,
+} from '../../common/diagnosticIsolation.js';
 import { ExtensionRunningLocationTracker } from '../../common/extensionRunningLocationTracker.js';
 import { ExtensionHostKind, IExtensionHostKindPicker } from '../../common/extensionHostKind.js';
 import { IExtensionManifestPropertiesService } from '../../common/extensionManifestPropertiesService.js';
@@ -35,7 +42,16 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createTracker(extensions: IExtensionDescription[], configuredAffinities: { [extensionId: string]: number } = {}, isExtensionDevelopment = false): ExtensionRunningLocationTracker {
+	teardown(() => {
+		_resetDiagnosticIsolationForTests();
+	});
+
+	function createTracker(
+		extensions: IExtensionDescription[],
+		configuredAffinities: { [extensionId: string]: number } = {},
+		isExtensionDevelopment = false,
+		extraConfig: { [key: string]: unknown } = {},
+	): ExtensionRunningLocationTracker {
 		const registry: IReadOnlyExtensionDescriptionRegistry = {
 			getAllExtensionDescriptions: () => extensions,
 			getExtensionDescription: (id: string | ExtensionIdentifier) => extensions.find(e => e.identifier.value === (typeof id === 'string' ? id : id.value)),
@@ -57,6 +73,9 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 
 		const configurationService = new TestConfigurationService();
 		configurationService.setUserConfiguration('extensions.experimental.affinity', configuredAffinities);
+		for (const [key, value] of Object.entries(extraConfig)) {
+			configurationService.setUserConfiguration(key, value);
+		}
 
 		const logService = new NullLogService();
 
@@ -173,8 +192,8 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		assert.strictEqual(locA!.affinity, locB!.affinity, 'One-way extensionAffinity should be sufficient to group extensions');
 	});
 
-	test('affinity policy isolates interview-toybox.desk-gnome on affinity 1', () => {
-		const deskGnome = createExtension('interview-toybox.desk-gnome');
+	test('empty diagnostic isolation set keeps all extensions on affinity 0', () => {
+		const deskGnome = createExtension(DIAGNOSTIC_ISOLATION_DEMO_SEED_ID);
 		const other = createExtension('publisher.other');
 
 		const tracker = createTracker([deskGnome, other]);
@@ -183,79 +202,121 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		const locDesk = runningLocations.get(deskGnome.identifier);
 		const locOther = runningLocations.get(other.identifier);
 
-		assert.ok(locDesk && locOther, 'Both extensions should have running locations');
-		assert.strictEqual(locDesk!.affinity, 1, 'Policy should place desk-gnome on affinity 1');
-		assert.strictEqual(locOther!.affinity, 0, 'Non-policy extensions stay on the shared host');
-	});
-
-	test('affinity policy assigns per dependency group and does not split it', () => {
-		const deskGnome = createExtension('interview-toybox.desk-gnome', ['publisher.sharedApi']);
-		const sharedApi = createExtension('publisher.sharedApi');
-		const other = createExtension('publisher.other');
-
-		const tracker = createTracker([deskGnome, sharedApi, other]);
-		const runningLocations = tracker.computeRunningLocation([deskGnome, sharedApi, other], [], true);
-
-		const locDesk = runningLocations.get(deskGnome.identifier);
-		const locShared = runningLocations.get(sharedApi.identifier);
-		const locOther = runningLocations.get(other.identifier);
-
-		assert.ok(locDesk && locShared && locOther);
-		assert.strictEqual(locDesk!.affinity, 1);
-		assert.strictEqual(locShared!.affinity, 1, 'Dependency group must share the policy affinity');
+		assert.ok(locDesk && locOther);
+		assert.strictEqual(locDesk!.affinity, 0, 'Default-off policy must not isolate desk-gnome');
 		assert.strictEqual(locOther!.affinity, 0);
 	});
 
-	test('user affinity setting overrides affinity policy', () => {
-		// Policy maps desk-gnome -> 1. If user incorrectly lost, both would share configured
-		// affinity 1 and land on the same resulting host. With user winning, desk-gnome is
-		// configured as 2 and vim as 1, so they get distinct resulting affinities.
-		const deskGnome = createExtension('interview-toybox.desk-gnome');
-		const vim = createExtension('vscodevim.vim');
+	test('diagnostic isolation set places flagged id group on its own affinity', () => {
+		const suspect = createExtension('publisher.suspect');
+		const other = createExtension('publisher.other');
 
-		const tracker = createTracker([deskGnome, vim], {
-			'interview-toybox.desk-gnome': 2,
-			'vscodevim.vim': 1,
-		});
-		const runningLocations = tracker.computeRunningLocation([deskGnome, vim], [], true);
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), true);
+		assert.strictEqual(addDiagnosticIsolation('publisher.suspect'), false, 'idempotent add');
 
-		const locDesk = runningLocations.get(deskGnome.identifier);
-		const locVim = runningLocations.get(vim.identifier);
+		const tracker = createTracker([suspect, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, other], [], true);
 
-		assert.ok(locDesk && locVim);
-		assert.notStrictEqual(locDesk!.affinity, locVim!.affinity, 'User-configured values must win over policy on the same id');
-		assert.ok(locDesk!.affinity > 0 && locVim!.affinity > 0);
+		const locSuspect = runningLocations.get(suspect.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locSuspect && locOther);
+		assert.strictEqual(locSuspect!.affinity, 1, 'Flagged extension lands on its own host');
+		assert.strictEqual(locOther!.affinity, 0, 'Unflagged extensions stay on the shared host');
 	});
 
-	test('user affinity for another extension does not remove policy for desk-gnome', () => {
-		const deskGnome = createExtension('interview-toybox.desk-gnome');
-		const vim = createExtension('vscodevim.vim');
+	test('diagnostic isolation assigns per dependency group and does not split it', () => {
+		const suspect = createExtension('publisher.suspect', ['publisher.sharedApi']);
+		const sharedApi = createExtension('publisher.sharedApi');
+		const other = createExtension('publisher.other');
 
-		const tracker = createTracker([deskGnome, vim], {
-			'vscodevim.vim': 1,
-		});
-		const runningLocations = tracker.computeRunningLocation([deskGnome, vim], [], true);
+		addDiagnosticIsolation('publisher.suspect');
 
-		const locDesk = runningLocations.get(deskGnome.identifier);
-		const locVim = runningLocations.get(vim.identifier);
+		const tracker = createTracker([suspect, sharedApi, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, sharedApi, other], [], true);
 
-		assert.ok(locDesk && locVim);
-		// Both request configured affinity 1; they share the same resulting affinity slot.
-		assert.strictEqual(locDesk!.affinity, locVim!.affinity);
-		assert.ok(locDesk!.affinity > 0);
+		const locSuspect = runningLocations.get(suspect.identifier);
+		const locShared = runningLocations.get(sharedApi.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locSuspect && locShared && locOther);
+		assert.strictEqual(locSuspect!.affinity, 1);
+		assert.strictEqual(locShared!.affinity, 1, 'Dependency group must share the isolation affinity');
+		assert.strictEqual(locOther!.affinity, 0);
 	});
 
-	test('isExtensionDevelopment ignores affinity policy and user setting', () => {
-		const deskGnome = createExtension('interview-toybox.desk-gnome');
+	test('demo flag seeds desk-gnome into the isolation set', () => {
+		const deskGnome = createExtension(DIAGNOSTIC_ISOLATION_DEMO_SEED_ID);
+		const other = createExtension('publisher.other');
 
-		const tracker = createTracker([deskGnome], {
-			'interview-toybox.desk-gnome': 2,
+		const tracker = createTracker([deskGnome, other], {}, false, {
+			[DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY]: true,
+		});
+		const runningLocations = tracker.computeRunningLocation([deskGnome, other], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locDesk && locOther);
+		assert.strictEqual(locDesk!.affinity, 1, 'Demo seed must place desk-gnome on affinity 1');
+		assert.strictEqual(locOther!.affinity, 0);
+	});
+
+	test('removeDiagnosticIsolation restores shared-host placement on next compute', () => {
+		const suspect = createExtension('publisher.suspect');
+		const other = createExtension('publisher.other');
+
+		addDiagnosticIsolation('publisher.suspect');
+		assert.strictEqual(removeDiagnosticIsolation('publisher.suspect'), true);
+
+		const tracker = createTracker([suspect, other]);
+		const runningLocations = tracker.computeRunningLocation([suspect, other], [], true);
+
+		assert.strictEqual(runningLocations.get(suspect.identifier)!.affinity, 0);
+		assert.strictEqual(runningLocations.get(other.identifier)!.affinity, 0);
+	});
+
+	test('tracker add/remove wrappers mutate the shared isolation set', () => {
+		const tracker = createTracker([]);
+		assert.deepStrictEqual(tracker.getDiagnosticIsolationIds(), []);
+		assert.strictEqual(tracker.addDiagnosticIsolation('publisher.suspect'), true);
+		assert.deepStrictEqual(tracker.getDiagnosticIsolationIds(), ['publisher.suspect']);
+		assert.strictEqual(tracker.removeDiagnosticIsolation('publisher.suspect'), true);
+		assert.deepStrictEqual(tracker.getDiagnosticIsolationIds(), []);
+	});
+
+	test('user affinity setting overrides diagnostic isolation policy', () => {
+		const suspect = createExtension('publisher.suspect');
+		const vim = createExtension('vscodevim.vim');
+
+		addDiagnosticIsolation('publisher.suspect');
+
+		const tracker = createTracker([suspect, vim], {
+			'publisher.suspect': 2,
+			'vscodevim.vim': 1,
+		});
+		const runningLocations = tracker.computeRunningLocation([suspect, vim], [], true);
+
+		const locSuspect = runningLocations.get(suspect.identifier);
+		const locVim = runningLocations.get(vim.identifier);
+
+		assert.ok(locSuspect && locVim);
+		assert.notStrictEqual(locSuspect!.affinity, locVim!.affinity, 'User-configured values must win over policy on the same id');
+		assert.ok(locSuspect!.affinity > 0 && locVim!.affinity > 0);
+	});
+
+	test('isExtensionDevelopment ignores diagnostic isolation and user setting', () => {
+		const suspect = createExtension('publisher.suspect');
+		addDiagnosticIsolation('publisher.suspect');
+
+		const tracker = createTracker([suspect], {
+			'publisher.suspect': 2,
 		}, true);
-		const runningLocations = tracker.computeRunningLocation([deskGnome], [], true);
+		const runningLocations = tracker.computeRunningLocation([suspect], [], true);
 
-		const locDesk = runningLocations.get(deskGnome.identifier);
-		assert.ok(locDesk);
-		assert.strictEqual(locDesk!.affinity, 0, 'Debug / extensionDevelopmentPath must skip affinity');
+		const loc = runningLocations.get(suspect.identifier);
+		assert.ok(loc);
+		assert.strictEqual(loc!.affinity, 0, 'Debug / extensionDevelopmentPath must skip affinity');
 	});
 
 	test('localProcessExtensionHostLogsPath suffixes by affinity', () => {
