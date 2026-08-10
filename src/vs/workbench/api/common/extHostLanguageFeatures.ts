@@ -28,6 +28,7 @@ import { localize } from '../../../nls.js';
 import { ExtensionIdentifier, IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
 import { ILogService } from '../../../platform/log/common/log.js';
 import { isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
+import { ensureActiveLongTaskMonitor } from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
 import { Cache } from './cache.js';
 import * as extHostProtocol from './extHost.protocol.js';
 import { IExtHostApiDeprecationService } from './extHostApiDeprecationService.js';
@@ -2225,7 +2226,11 @@ export class ExtHostLanguageFeatures extends CoreDisposable implements extHostPr
 			this._logService.trace(`[${data.extension.identifier.value}] INVOKE provider '${callback.toString().replace(/[\r\n]/g, '')}'`);
 		}
 
-		const result = callback(data.adapter, data.extension);
+		const result = ensureActiveLongTaskMonitor().measureSync(
+			'provider',
+			data.extension.identifier.value,
+			() => callback(data.adapter as A, data.extension),
+		);
 
 		// logging,tracing
 		Promise.resolve(result).catch(err => {

@@ -10,6 +10,8 @@
  * only — never paths or contents. Affinity is stamped main-thread-side.
  */
 
+import { flushActiveFlightRecorderInto } from '../../../../platform/telemetry/common/flightRecorder.js';
+
 /** Fixed RSS bucket edges in MB (telemetry reports the highest edge ≤ RSS). */
 export const RSS_BUCKET_EDGES_MB: readonly number[] = [128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192];
 
@@ -236,6 +238,23 @@ export function buildMemoryAlertTelemetryPayload(
 		trigger,
 		thresholdBucketMb,
 	};
+}
+
+/**
+ * Alert numbers plus optional active flight-recorder ring (u45).
+ * Use when emitting via a Record/guard-safe path that admits `fr*` leaves;
+ * the GDPR-typed `$publicLog2` call site keeps {@link buildMemoryAlertTelemetryPayload}.
+ */
+export function buildMemoryAlertDiagnosticPayload(
+	sample: ExtHostMemorySample,
+	trigger: MemoryAlertTrigger,
+	thresholdBucketMb: number,
+): Record<string, unknown> {
+	const data: Record<string, unknown> = {
+		...buildMemoryAlertTelemetryPayload(sample, trigger, thresholdBucketMb),
+	};
+	flushActiveFlightRecorderInto(data);
+	return data;
 }
 
 /** Local metrics line (numbers only). Raw RSS MB is OK here — file is not exfiltrated. */

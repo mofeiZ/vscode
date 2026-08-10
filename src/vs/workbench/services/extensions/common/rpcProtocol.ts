@@ -16,6 +16,7 @@ import { IURITransformer, transformIncomingURIs } from '../../../../base/common/
 import { IMessagePassingProtocol } from '../../../../base/parts/ipc/common/ipc.js';
 import { CanceledLazyPromise, LazyPromise } from './lazyPromise.js';
 import { getStringIdentifierForProxy, IRPCProtocol, Proxied, ProxyIdentifier, SerializableObjectWithBuffers } from './proxyIdentifier.js';
+import { getActiveLongTaskMonitor } from './extensionHostLongTaskMonitor.js';
 
 export interface JSONStringifyReplacer {
 	(key: string, value: any): any;
@@ -455,7 +456,12 @@ export class RPCProtocol extends Disposable implements IRPCProtocol {
 		if (typeof method !== 'function') {
 			throw new Error('Unknown method ' + methodName + ' on actor ' + getStringIdentifierForProxy(rpcId));
 		}
-		return method.apply(actor, args);
+		const monitor = getActiveLongTaskMonitor();
+		if (!monitor) {
+			return method.apply(actor, args);
+		}
+		// Catch-all: times every main→EH call; skips when an attributed wrap already ran.
+		return monitor.measureRpc(() => method.apply(actor, args));
 	}
 
 	private _remoteCall(rpcId: number, methodName: string, args: any[]): Promise<any> {

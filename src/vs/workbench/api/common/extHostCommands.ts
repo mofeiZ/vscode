@@ -31,6 +31,7 @@ import { TelemetryTrustedValue } from '../../../platform/telemetry/common/teleme
 import { IExtHostTelemetry } from './extHostTelemetry.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { isCancellationError } from '../../../base/common/errors.js';
+import { ensureActiveLongTaskMonitor } from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
 
 interface CommandHandler {
 	callback: Function;
@@ -245,7 +246,12 @@ export class ExtHostCommands implements ExtHostCommandsShape {
 
 		const stopWatch = StopWatch.create();
 		try {
-			return await callback.apply(thisArg, args);
+			const extensionId = command.extension?.identifier.value;
+			return await ensureActiveLongTaskMonitor().measureSync(
+				'command',
+				extensionId,
+				() => callback.apply(thisArg, args),
+			);
 		} catch (err) {
 			// The indirection-command from the converter can fail when invoking the actual
 			// command and in that case it is better to blame the correct command

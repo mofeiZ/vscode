@@ -54,6 +54,13 @@ import {
 	writeSnapshot,
 } from '../../services/extensions/node/extensionHostHeapCapture.js';
 import { IExtHostCommands } from '../common/extHostCommands.js';
+import {
+	ensureActiveLongTaskMonitor,
+	setActiveLongTaskMonitor,
+	type ExtensionHostLongTaskMonitor,
+} from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
+import type { GuardSafeTelemetrySink } from '../../../platform/telemetry/common/guardSafeEmit.js';
+import { monitorEventLoopDelay, type IntervalHistogram } from 'perf_hooks';
 const require = nodeModule.createRequire(import.meta.url);
 
 class NodeModuleRequireInterceptor extends RequireInterceptor {
@@ -182,6 +189,9 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 	private readonly _memorySampleRing = new MemorySampleRing();
 	private _memoryLogger: ILogger | undefined;
 	private _heapDiagnosis: HeapDiagnosisCoordinator | undefined;
+	private _longTaskMonitor: ExtensionHostLongTaskMonitor | undefined;
+	private _eventLoopDelay: IntervalHistogram | undefined;
+	private _longTaskTelemetrySink: GuardSafeTelemetrySink | undefined;
 
 	protected async _beforeAlmostReadyToRunExtensions(): Promise<void> {
 		// make sure console.log calls make it to the render
@@ -289,6 +299,32 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			}
 		));
 
+		// P-A long-task monitor + event-loop delay canary (rides this same 30s tick).
+		this._longTaskMonitor = ensureActiveLongTaskMonitor();
+		setActiveLongTaskMonitor(this._longTaskMonitor);
+		this._store.add(toDisposable(() => {
+			if (this._eventLoopDelay) {
+				this._eventLoopDelay.disable();
+				this._eventLoopDelay = undefined;
+			}
+			setActiveLongTaskMonitor(undefined);
+			this._longTaskMonitor = undefined;
+		}));
+		try {
+			this._eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+			this._eventLoopDelay.enable();
+		} catch (err) {
+			this._logService.warn('[exthostLongTask] monitorEventLoopDelay unavailable', err);
+		}
+		this._longTaskTelemetrySink = {
+			publicLog: (eventName, data) => {
+				this._mainThreadTelemetryProxy.$publicLog(eventName, data);
+			},
+			publicLog2: (eventName, data) => {
+				this._mainThreadTelemetryProxy.$publicLog2(eventName, data as never);
+			},
+		};
+
 		const timer = this._store.add(new IntervalTimer());
 		const takeSample = () => {
 			try {
@@ -348,6 +384,9 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 		// Tier-0 low-cadence attribution flush (rate-limited inside coordinator; not gated).
 		this._heapDiagnosis?.onAttributionCadence();
 
+		// P-A: fold ELD histogram into the long-task window; flush aggregated events when due.
+		this._sampleLongTaskEventLoopLag(sample.tsMs);
+
 		const decision = decideMemoryAlert(
 			{ rssBucketMb: sample.rssBucketMb, growthMbPerMin: sample.growthMbPerMin },
 			this._memoryAlertState,
@@ -397,6 +436,38 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			if (!heap.snapshot.started) {
 				this._logService.trace(`[exthostHeapDiagnosis] Tier-1 snapshot skipped: ${heap.snapshot.reason}`);
 			}
+		}
+	}
+
+	private _sampleLongTaskEventLoopLag(nowWallMs: number): void {
+		const monitor = this._longTaskMonitor;
+		if (!monitor) {
+			return;
+		}
+		const hist = this._eventLoopDelay;
+		if (hist) {
+			// IntervalHistogram values are nanoseconds.
+			const toMs = (ns: number) => ns / 1e6;
+			monitor.noteEventLoopLag({
+				p50Ms: toMs(hist.percentile(50)),
+				p99Ms: toMs(hist.percentile(99)),
+				maxMs: toMs(hist.max),
+			});
+			hist.reset();
+		}
+		const flush = monitor.flushIfDue(nowWallMs, this._longTaskTelemetrySink);
+		if (!flush) {
+			return;
+		}
+		for (const alert of flush.alerts) {
+			if (alert.fire) {
+				this._logService.warn(
+					`[exthostLongTask] alert reason=${alert.reason} opaqueExtId=${alert.opaqueExtId} kind=${alert.kind} countAt500=${alert.countAt500 ?? 0}`,
+				);
+			}
+		}
+		if (flush.eldAlert) {
+			this._logService.warn('[exthostLongTask] event-loop lag alert (p99 sustained)');
 		}
 	}
 

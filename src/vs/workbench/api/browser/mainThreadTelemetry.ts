@@ -101,7 +101,13 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 		data[MainThreadTelemetry._name] = true;
 
 		// Per-EH memory / heap-attribution events: stamp affinity main-thread-side (EH does not know it).
-		if (eventName === 'exthostMemorySample' || eventName === 'exthostMemoryAlert' || eventName === 'exthostHeapAttribution') {
+		if (
+			eventName === 'exthostMemorySample'
+			|| eventName === 'exthostMemoryAlert'
+			|| eventName === 'exthostHeapAttribution'
+			|| eventName === 'exthostLongTask'
+			|| eventName === 'exthostEventLoopLag'
+		) {
 			data['affinity'] = this._affinity;
 		}
 

@@ -29,6 +29,7 @@ import { ExtensionDescriptionRegistry } from '../../services/extensions/common/e
 import { UIKind } from '../../services/extensions/common/extensionHostProtocol.js';
 import { checkProposedApiEnabled, isProposedApiEnabled } from '../../services/extensions/common/extensions.js';
 import { ProxyIdentifier } from '../../services/extensions/common/proxyIdentifier.js';
+import { ensureActiveLongTaskMonitor } from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
 import { AISearchKeyword, ExcludeSettingOptions, TextSearchCompleteMessageType, TextSearchContext2, TextSearchMatch2 } from '../../services/search/common/searchExtTypes.js';
 import { CandidatePortSource, ExtHostContext, ExtHostLogLevelServiceShape, IDocumentDiffLineChangeDto, MainContext } from './extHost.protocol.js';
 import { ExtHostRelatedInformation } from './extHostAiRelatedInformation.js';
@@ -293,7 +294,11 @@ export function createApiFactoryAndRegisterActors(accessor: ServicesAccessor): I
 			return (listener, thisArgs, disposables) => {
 				const handle = actual(e => {
 					try {
-						listener.call(thisArgs, e);
+						ensureActiveLongTaskMonitor().measureSync(
+							'event',
+							extension.identifier.value,
+							() => listener.call(thisArgs, e),
+						);
 					} catch (err) {
 						errors.onUnexpectedExternalError(new ExtensionError(extension.identifier, err, 'FAILED to handle event'));
 					}

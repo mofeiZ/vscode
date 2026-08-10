@@ -6,6 +6,7 @@
 import { VSBuffer } from '../../../../base/common/buffer.js';
 import { joinPath } from '../../../../base/common/resources.js';
 import { URI } from '../../../../base/common/uri.js';
+import { flushActiveFlightRecorderInto } from '../../../../platform/telemetry/common/flightRecorder.js';
 import { ExtensionHostExitCode } from './extensionHostProtocol.js';
 
 /**
@@ -209,6 +210,8 @@ export function crashRecordTelemetryData(record: ExtensionHostCrashRecord, extra
 	if (typeof extra?.flushDelaySec === 'number') {
 		data.flushDelaySec = extra.flushDelaySec;
 	}
+	// u45: attach active flight-recorder ring when registered (no-op otherwise).
+	flushActiveFlightRecorderInto(data);
 	return data;
 }
 
