@@ -16,6 +16,19 @@ import { IExtensionManifestPropertiesService } from './extensionManifestProperti
 import { ExtensionRunningLocation, LocalProcessRunningLocation, LocalWebWorkerRunningLocation, RemoteRunningLocation } from './extensionRunningLocation.js';
 import { isProposedApiEnabled } from './extensions.js';
 
+/**
+ * Affinity policy seam (fork): automatic LocalProcess affinities for designated
+ * extensions. Upstream only ever reads `extensions.experimental.affinity`; this
+ * map is the missing policy source. Assignments are merged into the same
+ * accommodation loop as the user setting (user wins on conflict) and therefore
+ * still run per dependency/`extensionAffinity` GROUP — never host-per-extension.
+ * Interview scope: isolate Desk Gnome. Affinity 0 remains the default for all
+ * other extensions. Skipped under extension development (same as the setting).
+ */
+const EXTENSION_AFFINITY_POLICY: Readonly<{ [extensionId: string]: number }> = Object.freeze({
+	'interview-toybox.desk-gnome': 1,
+});
+
 export class ExtensionRunningLocationTracker {
 
 	private _runningLocation = new ExtensionIdentifierMap<ExtensionRunningLocation | null>();
@@ -163,8 +176,10 @@ export class ExtensionRunningLocationTracker {
 		// When doing extension host debugging, we will ignore the configured affinity
 		// because we can currently debug a single extension host
 		if (!this._environmentService.isExtensionDevelopment) {
-			// Go through each configured affinity and try to accomodate it
-			const configuredAffinities = this._configurationService.getValue<{ [extensionId: string]: number } | undefined>('extensions.experimental.affinity') || {};
+			// Go through each configured affinity and try to accomodate it.
+			// Policy first, then user setting — user wins on the same extension id.
+			const userAffinities = this._configurationService.getValue<{ [extensionId: string]: number } | undefined>('extensions.experimental.affinity') || {};
+			const configuredAffinities: { [extensionId: string]: number } = { ...EXTENSION_AFFINITY_POLICY, ...userAffinities };
 			const configuredExtensionIds = Object.keys(configuredAffinities);
 			const configuredAffinityToResultingAffinity = new Map<number, number>();
 			for (const extensionId of configuredExtensionIds) {

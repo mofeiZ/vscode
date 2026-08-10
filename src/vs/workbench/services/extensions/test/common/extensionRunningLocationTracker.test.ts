@@ -34,7 +34,7 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 
 	ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createTracker(extensions: IExtensionDescription[], configuredAffinities: { [extensionId: string]: number } = {}): ExtensionRunningLocationTracker {
+	function createTracker(extensions: IExtensionDescription[], configuredAffinities: { [extensionId: string]: number } = {}, isExtensionDevelopment = false): ExtensionRunningLocationTracker {
 		const registry: IReadOnlyExtensionDescriptionRegistry = {
 			getAllExtensionDescriptions: () => extensions,
 			getExtensionDescription: (id: string | ExtensionIdentifier) => extensions.find(e => e.identifier.value === (typeof id === 'string' ? id : id.value)),
@@ -50,7 +50,7 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		};
 
 		const environmentService = <IWorkbenchEnvironmentService>{
-			isExtensionDevelopment: false,
+			isExtensionDevelopment,
 			extensionDevelopmentKind: undefined,
 		};
 
@@ -170,5 +170,90 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 
 		assert.ok(locA && locB, 'Both extensions should have running locations');
 		assert.strictEqual(locA!.affinity, locB!.affinity, 'One-way extensionAffinity should be sufficient to group extensions');
+	});
+
+	test('affinity policy isolates interview-toybox.desk-gnome on affinity 1', () => {
+		const deskGnome = createExtension('interview-toybox.desk-gnome');
+		const other = createExtension('publisher.other');
+
+		const tracker = createTracker([deskGnome, other]);
+		const runningLocations = tracker.computeRunningLocation([deskGnome, other], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locDesk && locOther, 'Both extensions should have running locations');
+		assert.strictEqual(locDesk!.affinity, 1, 'Policy should place desk-gnome on affinity 1');
+		assert.strictEqual(locOther!.affinity, 0, 'Non-policy extensions stay on the shared host');
+	});
+
+	test('affinity policy assigns per dependency group and does not split it', () => {
+		const deskGnome = createExtension('interview-toybox.desk-gnome', ['publisher.sharedApi']);
+		const sharedApi = createExtension('publisher.sharedApi');
+		const other = createExtension('publisher.other');
+
+		const tracker = createTracker([deskGnome, sharedApi, other]);
+		const runningLocations = tracker.computeRunningLocation([deskGnome, sharedApi, other], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		const locShared = runningLocations.get(sharedApi.identifier);
+		const locOther = runningLocations.get(other.identifier);
+
+		assert.ok(locDesk && locShared && locOther);
+		assert.strictEqual(locDesk!.affinity, 1);
+		assert.strictEqual(locShared!.affinity, 1, 'Dependency group must share the policy affinity');
+		assert.strictEqual(locOther!.affinity, 0);
+	});
+
+	test('user affinity setting overrides affinity policy', () => {
+		// Policy maps desk-gnome -> 1. If user incorrectly lost, both would share configured
+		// affinity 1 and land on the same resulting host. With user winning, desk-gnome is
+		// configured as 2 and vim as 1, so they get distinct resulting affinities.
+		const deskGnome = createExtension('interview-toybox.desk-gnome');
+		const vim = createExtension('vscodevim.vim');
+
+		const tracker = createTracker([deskGnome, vim], {
+			'interview-toybox.desk-gnome': 2,
+			'vscodevim.vim': 1,
+		});
+		const runningLocations = tracker.computeRunningLocation([deskGnome, vim], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		const locVim = runningLocations.get(vim.identifier);
+
+		assert.ok(locDesk && locVim);
+		assert.notStrictEqual(locDesk!.affinity, locVim!.affinity, 'User-configured values must win over policy on the same id');
+		assert.ok(locDesk!.affinity > 0 && locVim!.affinity > 0);
+	});
+
+	test('user affinity for another extension does not remove policy for desk-gnome', () => {
+		const deskGnome = createExtension('interview-toybox.desk-gnome');
+		const vim = createExtension('vscodevim.vim');
+
+		const tracker = createTracker([deskGnome, vim], {
+			'vscodevim.vim': 1,
+		});
+		const runningLocations = tracker.computeRunningLocation([deskGnome, vim], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		const locVim = runningLocations.get(vim.identifier);
+
+		assert.ok(locDesk && locVim);
+		// Both request configured affinity 1; they share the same resulting affinity slot.
+		assert.strictEqual(locDesk!.affinity, locVim!.affinity);
+		assert.ok(locDesk!.affinity > 0);
+	});
+
+	test('isExtensionDevelopment ignores affinity policy and user setting', () => {
+		const deskGnome = createExtension('interview-toybox.desk-gnome');
+
+		const tracker = createTracker([deskGnome], {
+			'interview-toybox.desk-gnome': 2,
+		}, true);
+		const runningLocations = tracker.computeRunningLocation([deskGnome], [], true);
+
+		const locDesk = runningLocations.get(deskGnome.identifier);
+		assert.ok(locDesk);
+		assert.strictEqual(locDesk!.affinity, 0, 'Debug / extensionDevelopmentPath must skip affinity');
 	});
 });
