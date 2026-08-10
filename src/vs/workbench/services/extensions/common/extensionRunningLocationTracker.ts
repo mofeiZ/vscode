@@ -201,7 +201,11 @@ export class ExtensionRunningLocationTracker {
 			const userAffinities = this._configurationService.getValue<{ [extensionId: string]: number } | undefined>('extensions.experimental.affinity') || {};
 			const demoSeedDeskGnome = this._configurationService.getValue<boolean>(DIAGNOSTIC_ISOLATION_DEMO_CONFIG_KEY) === true;
 			const productDemoSeed = product.demoDiagnosticIsolationSeedDeskGnome === true;
-			const policyAffinities = buildDiagnosticIsolationAffinities({ demoSeedDeskGnome, productDemoSeed });
+			const policyAffinities = buildDiagnosticIsolationAffinities({
+				demoSeedDeskGnome,
+				productDemoSeed,
+				productInternalDiagnostics: product.internalDiagnosticsEnabled === true,
+			});
 			const configuredAffinities: { [extensionId: string]: number } = { ...policyAffinities, ...userAffinities };
 			const configuredExtensionIds = Object.keys(configuredAffinities);
 			const configuredAffinityToResultingAffinity = new Map<number, number>();
