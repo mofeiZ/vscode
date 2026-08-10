@@ -59,6 +59,11 @@ import {
 	setActiveLongTaskMonitor,
 	type ExtensionHostLongTaskMonitor,
 } from '../../services/extensions/common/extensionHostLongTaskMonitor.js';
+import {
+	CPU_PROFILE_DURATION_MS,
+	ExtensionHostCpuMonitor,
+} from '../../services/extensions/common/extensionHostCpuMonitor.js';
+import { captureShortCpuProfile } from '../../services/extensions/node/extensionHostCpuCapture.js';
 import type { GuardSafeTelemetrySink } from '../../../platform/telemetry/common/guardSafeEmit.js';
 import { monitorEventLoopDelay, type IntervalHistogram } from 'perf_hooks';
 const require = nodeModule.createRequire(import.meta.url);
@@ -192,6 +197,7 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 	private _longTaskMonitor: ExtensionHostLongTaskMonitor | undefined;
 	private _eventLoopDelay: IntervalHistogram | undefined;
 	private _longTaskTelemetrySink: GuardSafeTelemetrySink | undefined;
+	private _cpuMonitor: ExtensionHostCpuMonitor | undefined;
 
 	protected async _beforeAlmostReadyToRunExtensions(): Promise<void> {
 		// make sure console.log calls make it to the render
@@ -325,6 +331,12 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			},
 		};
 
+		// P-B: coarse cpuUsage delta rides this same 30s tick (no second timer).
+		this._cpuMonitor = new ExtensionHostCpuMonitor();
+		this._store.add(toDisposable(() => {
+			this._cpuMonitor = undefined;
+		}));
+
 		const timer = this._store.add(new IntervalTimer());
 		const takeSample = () => {
 			try {
@@ -386,6 +398,9 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 
 		// P-A: fold ELD histogram into the long-task window; flush aggregated events when due.
 		this._sampleLongTaskEventLoopLag(sample.tsMs);
+
+		// P-B: cpuUsage delta + gated short profile on sustained high CPU.
+		this._sampleExtensionHostCpu(sample.tsMs);
 
 		const decision = decideMemoryAlert(
 			{ rssBucketMb: sample.rssBucketMb, growthMbPerMin: sample.growthMbPerMin },
@@ -468,6 +483,69 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 		}
 		if (flush.eldAlert) {
 			this._logService.warn('[exthostLongTask] event-loop lag alert (p99 sustained)');
+		}
+	}
+
+	private _sampleExtensionHostCpu(nowWallMs: number): void {
+		const monitor = this._cpuMonitor;
+		if (!monitor) {
+			return;
+		}
+		const tick = monitor.onCpuSample({
+			cpuUsage: process.cpuUsage(),
+			wallMs: nowWallMs,
+			uptimeSec: process.uptime(),
+			sink: this._longTaskTelemetrySink,
+		});
+		if (tick.sample) {
+			this._memoryLogger?.info(
+				`CPU SAMPLE seq=${tick.sample.sampleSeq} cpuPct=${Math.round(tick.sample.cpuPct)} cpuPctBucket=${tick.sample.cpuPctBucket} uptimeSec=${tick.sample.uptimeSec}`,
+			);
+		}
+		if (!tick.shouldProfile) {
+			return;
+		}
+		const sustainedSec = tick.sustainedSec;
+		const cpuPctBucket = tick.sample?.cpuPctBucket ?? 0;
+		void this._runGatedCpuProfile(sustainedSec, cpuPctBucket);
+	}
+
+	private async _runGatedCpuProfile(sustainedSec: number, cpuPctBucket: number): Promise<void> {
+		const monitor = this._cpuMonitor;
+		if (!monitor) {
+			return;
+		}
+		try {
+			const profile = await captureShortCpuProfile(CPU_PROFILE_DURATION_MS);
+			if (!profile) {
+				monitor.cancelProfile();
+				this._logService.warn('[exthostCpu] gated profile unavailable (inspector busy or failed)');
+				return;
+			}
+			const categories: Array<[string, string]> = [];
+			for (const ext of this._myRegistry.getAllExtensionDescriptions()) {
+				if (ext.extensionLocation.scheme === Schemas.file) {
+					categories.push([URI.file(ext.extensionLocation.fsPath).toString(true), ext.identifier.value]);
+				}
+			}
+			const { attribution, alertPayload } = monitor.completeProfile({
+				profile,
+				categories,
+				sink: this._longTaskTelemetrySink,
+				profileMs: CPU_PROFILE_DURATION_MS,
+				cpuPctBucket,
+				sustainedSec,
+			});
+			// Local log may include the real id; telemetry carries opaque only.
+			this._logService.warn(
+				`[exthostCpu] alert resultKind=${alertPayload.resultKind} cpuPctBucket=${alertPayload.cpuPctBucket} topSharePctBucket=${alertPayload.topSharePctBucket} topOpaque=${alertPayload.topOpaqueExtId ?? '-'} topReal=${attribution.topRealExtId ?? '-'}`,
+			);
+			this._memoryLogger?.info(
+				`CPU ALERT resultKind=${alertPayload.resultKind} cpuPctBucket=${alertPayload.cpuPctBucket} sustainedSecBucket=${alertPayload.sustainedSecBucket} topSharePctBucket=${alertPayload.topSharePctBucket} topOpaqueExtId=${alertPayload.topOpaqueExtId ?? '-'}`,
+			);
+		} catch (err) {
+			monitor.cancelProfile();
+			this._logService.warn('[exthostCpu] gated profile failed', err);
 		}
 	}
 

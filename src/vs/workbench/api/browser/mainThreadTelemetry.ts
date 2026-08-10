@@ -107,6 +107,8 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 			|| eventName === 'exthostHeapAttribution'
 			|| eventName === 'exthostLongTask'
 			|| eventName === 'exthostEventLoopLag'
+			|| eventName === 'exthostCpuSample'
+			|| eventName === 'exthostCpuAlert'
 		) {
 			data['affinity'] = this._affinity;
 		}
