@@ -69,12 +69,23 @@ const ABS_WIN_HOME_RE = /(?:^|[\s"'=`])([A-Za-z]:\\Users\\[^\s"'`]+)/;
  * catches /tmp/... workspace roots used in disposable OSS proof runs.
  */
 const ABS_PATH_RE = /(?:file:\/\/)?(?:[a-zA-Z]:(?:\\\\|\\|\/)|(?:\\\\|\\|\/))(?:[\w\-\._@]+(?:\\\\|\\|\/))+[\w\-\._@]+/;
+/**
+ * Extra absolute roots that must not persist in EH stderr (beyond home/tmp).
+ * Kept separate from ABS_PATH_RE so URL-like strings are not over-redacted in
+ * residual telemetry scanning.
+ */
+const ABS_UNIX_SENSITIVE_ROOT_RE = /(?:^|[\s"'=`])(\/(?:Users|home|tmp|private\/tmp|opt|var\/folders|var\/tmp|etc|root)\/[^\s"'`]+)/;
+const ABS_WIN_ANY_DRIVE_RE = /(?:^|[\s"'=`])([A-Za-z]:\\(?:Users\\|[^\\\s"'`]+\\)[^\s"'`]+)/;
 
 const SECRET_REGEXES: ReadonlyArray<{ label: string; regex: RegExp }> = [
 	{ label: 'GitHub Token', regex: /(gh[psuro]_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})/ },
 	{ label: 'Slack Token', regex: /xox[pbar]\-[A-Za-z0-9]/ },
+	{ label: 'JWT', regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/ },
 	{ label: 'Generic Secret', regex: /(key|token|sig|secret|signature|password|passwd|pwd)[^a-zA-Z0-9]/i },
 ];
+
+/** Indexed char-code object keys: c0..cN or bare 0..N. */
+const CHAR_CODE_KEY_RE = /^c?(\d+)$/;
 
 /** Slash / path-separator homoglyphs → ASCII `/` after NFKC. */
 const SLASH_HOMOGLYPH_RE = /[\uFF0F\u2044\u2215\u2571\u27CB\u29F8\uFE68]/g;
@@ -172,11 +183,83 @@ function isTypedNumberArray(value: object): value is ArrayLike<number> {
 	return ArrayBuffer.isView(value) && !(value instanceof DataView);
 }
 
+function isCodeUnitNumber(n: unknown): n is number {
+	return typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 0x10ffff;
+}
+
+type NumericObjectReassembly = {
+	readonly built?: string;
+	readonly codeUnitCount: number;
+	/** Contiguous c0..cN / 0..N keys — char-code smuggling shape (sr1#2). */
+	readonly indexedCharCodeShape: boolean;
+};
+
+/**
+ * Rebuild a candidate string from dense/indexed numeric object shapes
+ * (sr1#2: `{ c0:47, c1:85, ... }` under the 24-leaf cap).
+ */
+function tryReassembleNumericObject(record: Record<string, unknown>): NumericObjectReassembly {
+	const names = Object.getOwnPropertyNames(record);
+	if (names.length === 0) {
+		return { codeUnitCount: 0, indexedCharCodeShape: false };
+	}
+
+	const indexed: { idx: number; n: number }[] = [];
+	const plainCodeUnits: number[] = [];
+	let allValuesAreCodeUnits = true;
+
+	for (const key of names) {
+		const v = record[key];
+		if (!isCodeUnitNumber(v)) {
+			allValuesAreCodeUnits = false;
+			break;
+		}
+		plainCodeUnits.push(v);
+		const m = CHAR_CODE_KEY_RE.exec(key);
+		if (m) {
+			indexed.push({ idx: Number(m[1]), n: v });
+		}
+	}
+
+	if (!allValuesAreCodeUnits) {
+		return { codeUnitCount: 0, indexedCharCodeShape: false };
+	}
+
+	const codeUnitCount = plainCodeUnits.length;
+
+	if (indexed.length >= 4 && indexed.length === names.length) {
+		indexed.sort((a, b) => a.idx - b.idx);
+		let contiguous = true;
+		for (let i = 1; i < indexed.length; i++) {
+			if (indexed[i].idx !== indexed[i - 1].idx + 1) {
+				contiguous = false;
+				break;
+			}
+		}
+		if (contiguous) {
+			const built = indexed.map(e => String.fromCodePoint(e.n)).join('');
+			return { built, codeUnitCount, indexedCharCodeShape: true };
+		}
+	}
+
+	// Dense all-numeric-value object (no/partial index keys): stable key order.
+	// Scanned as a candidate string but not fail-closed (ordinary measurements).
+	if (plainCodeUnits.length >= 4) {
+		const sortedKeys = names.slice().sort();
+		const built = sortedKeys.map(k => String.fromCodePoint(record[k] as number)).join('');
+		return { built, codeUnitCount, indexedCharCodeShape: false };
+	}
+
+	return { codeUnitCount, indexedCharCodeShape: false };
+}
+
 export type FlattenTelemetryStringsResult = {
 	readonly strings: string[];
 	readonly numericLeafCount: number;
 	readonly depthAborted: boolean;
 	readonly oversizedNumberArray: boolean;
+	/** Contiguous indexed char-code object (`c0`..`cN`) seen (sr1#2). */
+	readonly indexedCharCodeObject: boolean;
 };
 
 /**
@@ -190,6 +273,7 @@ export function flattenTelemetryStringsDetailed(data: unknown): FlattenTelemetry
 	let numericLeafCount = 0;
 	let depthAborted = false;
 	let oversizedNumberArray = false;
+	let indexedCharCodeObject = false;
 
 	const pushString = (raw: string): void => {
 		if (raw.length === 0) {
@@ -213,7 +297,7 @@ export function flattenTelemetryStringsDetailed(data: unknown): FlattenTelemetry
 			const limit = Math.min(nums.length, 4096);
 			for (let i = 0; i < limit; i++) {
 				const n = nums[i];
-				if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 0x10ffff) {
+				if (!isCodeUnitNumber(n)) {
 					allCodeUnits = false;
 					break;
 				}
@@ -282,8 +366,36 @@ export function flattenTelemetryStringsDetailed(data: unknown): FlattenTelemetry
 				visit(record.value, depth + 1);
 				return;
 			}
+
+			// sr1#2: reassemble contiguous/dense numeric object shapes before
+			// walking leaves so `{ c0:47, c1:85, ... }` is scanned as a string.
+			const reassembled = tryReassembleNumericObject(record);
+			if (reassembled.indexedCharCodeShape) {
+				indexedCharCodeObject = true;
+				// Property-name-derived index slots count toward the numeric budget
+				// (keys like c0..cN are part of the smuggling channel).
+				numericLeafCount += reassembled.codeUnitCount;
+				if (reassembled.codeUnitCount > MAX_STRICT_NUMBER_ARRAY_LEN) {
+					oversizedNumberArray = true;
+				}
+				if (reassembled.built) {
+					pushString(reassembled.built);
+				}
+				for (const key of Object.getOwnPropertyNames(record)) {
+					pushString(key);
+				}
+				return;
+			}
+			if (reassembled.built) {
+				// Non-indexed all-numeric object: scan reconstructed candidate,
+				// then fall through so ordinary measurement leaves still count.
+				pushString(reassembled.built);
+			}
+
 			// Align with validateTelemetryData flatten (getOwnPropertyNames).
+			// sr1#1: scan canonicalized own-property names, not only values.
 			for (const key of Object.getOwnPropertyNames(record)) {
+				pushString(key);
 				visit(record[key], depth + 1);
 			}
 			return;
@@ -304,11 +416,13 @@ export function flattenTelemetryStringsDetailed(data: unknown): FlattenTelemetry
 		// join('/') on ordinary tokens (Error + test-error) false-positives the
 		// broad ABS_PATH_RE via a `/a/b` substring.
 		const pathSegment = (s: string): boolean =>
-			/^(Users|home|tmp|var|private)$/i.test(s)
+			/^(Users|home|tmp|var|private|opt)$/i.test(s)
 			|| s.startsWith('/')
 			|| s.startsWith('Users/')
 			|| s.startsWith('home/')
 			|| s.startsWith('tmp/')
+			|| s.startsWith('opt/')
+			|| s.startsWith('var/')
 			|| /^[A-Za-z]:$/.test(s)
 			|| /^[A-Za-z]:\\/.test(s);
 		if (leaves.some(pathSegment)) {
@@ -317,7 +431,7 @@ export function flattenTelemetryStringsDetailed(data: unknown): FlattenTelemetry
 		}
 	}
 
-	return { strings: out, numericLeafCount, depthAborted, oversizedNumberArray };
+	return { strings: out, numericLeafCount, depthAborted, oversizedNumberArray, indexedCharCodeObject };
 }
 
 /**
@@ -407,7 +521,13 @@ export function detectTelemetryUserData(
 	if (failClosedOnDepthAbort && flat.depthAborted) {
 		return { hit: true, layer: 'shape', detail: '<REDACTED: depth-limit>' };
 	}
-	if (boundMeasurements && (flat.oversizedNumberArray || flat.numericLeafCount > MAX_STRICT_NUMERIC_LEAVES)) {
+	if (boundMeasurements && (
+		flat.oversizedNumberArray
+		|| flat.numericLeafCount > MAX_STRICT_NUMERIC_LEAVES
+		// sr1#2: indexed char-code objects are a measurements-lane smuggling
+		// channel even when leaf count is under the cap.
+		|| flat.indexedCharCodeObject
+	)) {
 		return { hit: true, layer: 'shape', detail: '<REDACTED: measurements-bound>' };
 	}
 
@@ -417,7 +537,8 @@ export function detectTelemetryUserData(
 	}
 
 	if (strictShape) {
-		// Allowlist: every leaf string (and decoded candidates) must be an opaque token.
+		// Allowlist: every leaf string, own-property name, and decoded candidate
+		// must be an opaque token (sr1#1: keys are in scope).
 		for (const s of collectRawCanonicalLeaves(data)) {
 			if (!isAllowedExtensionTelemetryString(s)) {
 				return { hit: true, layer: 'shape', detail: '<REDACTED: disallowed-string-shape>' };
@@ -438,17 +559,22 @@ export function detectTelemetryUserData(
 
 function collectRawCanonicalLeaves(data: unknown): string[] {
 	const out: string[] = [];
+	const push = (value: string): void => {
+		if (value.length === 0) {
+			return;
+		}
+		const canonical = canonicalizeTelemetryString(value);
+		out.push(canonical);
+		for (const decoded of expandEncodedCandidates(canonical)) {
+			out.push(canonicalizeTelemetryString(decoded));
+		}
+	};
 	const visit = (value: unknown, depth: number): void => {
 		if (value === null || value === undefined || depth > MAX_VISIT_DEPTH) {
 			return;
 		}
 		if (typeof value === 'string') {
-			if (value.length > 0) {
-				out.push(canonicalizeTelemetryString(value));
-				for (const decoded of expandEncodedCandidates(canonicalizeTelemetryString(value))) {
-					out.push(canonicalizeTelemetryString(decoded));
-				}
-			}
+			push(value);
 			return;
 		}
 		if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
@@ -486,6 +612,13 @@ function collectRawCanonicalLeaves(data: unknown): string[] {
 				return;
 			}
 			for (const key of Object.getOwnPropertyNames(record)) {
+				// sr1#1: every own key must pass the allowlist. Check the key itself
+				// only — do not expand accidental base64/hex decodes of ordinary
+				// tokens like "duration" (those still go through residual scan via
+				// flattenTelemetryStringsDetailed).
+				if (key.length > 0) {
+					out.push(canonicalizeTelemetryString(key));
+				}
 				visit(record[key], depth + 1);
 			}
 		}
@@ -511,30 +644,79 @@ export function redactTelemetryGuardEventName(eventName: string): string {
 	return eventName;
 }
 
+function simpleHashPrefix(value: string): string {
+	// Non-crypto stable fingerprint for persisted EH lines (sr1#4 fail-closed).
+	let h = 2166136261;
+	for (let i = 0; i < value.length; i++) {
+		h ^= value.charCodeAt(i);
+		h = Math.imul(h, 16777619);
+	}
+	return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function tokenLooksLikeAbsolutePath(canonical: string): boolean {
+	if (!canonical.includes('/') && !canonical.includes('\\')) {
+		return false;
+	}
+	if (
+		ABS_UNIX_HOME_RE.test(canonical)
+		|| ABS_WIN_HOME_RE.test(canonical)
+		|| ABS_UNIX_SENSITIVE_ROOT_RE.test(canonical)
+		|| ABS_WIN_ANY_DRIVE_RE.test(canonical)
+	) {
+		return true;
+	}
+	return /^\/(?:Users|home|tmp|private\/tmp|opt|var\/folders|var\/tmp|etc|root)\//.test(canonical)
+		|| /^[A-Za-z]:[\\/]/.test(canonical);
+}
+
+function tokenLooksLikeUserContent(canonical: string): boolean {
+	if (canonical.length >= 160) {
+		return true;
+	}
+	// High-entropy / encoded blobs (base64-like) that survived decode-before-scan.
+	if (canonical.length >= 48 && /^[A-Za-z0-9+/=_-]+$/.test(canonical) && /[A-Za-z]/.test(canonical) && /\d/.test(canonical)) {
+		return true;
+	}
+	return false;
+}
+
 /**
- * Scrub a single EH stdout/stderr line before durable persistence (F1).
- * Preserves crash-diagnostic structure while removing home/tmp paths and secrets.
- * Avoids the broad ABS_PATH_RE (it false-positives on https://… URLs).
+ * Scrub a single EH stdout/stderr line before durable persistence (F1 / sr1#4).
+ * Decode-before-scan (base64/hex/url), expand path roots beyond home/tmp, and
+ * fail closed on residual user-content / secret-shaped tokens. Crash markers and
+ * short diagnostic structure survive; raw paths/contents/secrets do not.
  */
 export function scrubPersistedExtensionHostLogLine(line: string): string {
 	if (!line) {
 		return line;
 	}
 	let out = line;
+	out = out.replace(ABS_UNIX_SENSITIVE_ROOT_RE, ' <REDACTED: user-file-path>');
 	out = out.replace(ABS_UNIX_HOME_RE, ' <REDACTED: user-file-path>');
+	out = out.replace(ABS_WIN_ANY_DRIVE_RE, ' <REDACTED: user-file-path>');
 	out = out.replace(ABS_WIN_HOME_RE, ' <REDACTED: user-file-path>');
 	out = out.replace(/(?:^|[\s"'=`])(\/(?:tmp|private\/tmp)\/[^\s"'`]+)/g, ' <REDACTED: user-file-path>');
-	// Homoglyph / NFKC: redact individual tokens whose canonical form is a home/tmp path.
+
+	// Per-token: canonicalize, decode-before-scan, redact paths/secrets/content.
 	out = out.replace(/\S+/g, token => {
 		const canonical = canonicalizeTelemetryString(token);
-		if (ABS_UNIX_HOME_RE.test(canonical) || ABS_WIN_HOME_RE.test(canonical)) {
-			return '<REDACTED: user-file-path>';
+		const candidates = [canonical, ...expandEncodedCandidates(canonical).map(canonicalizeTelemetryString)];
+		for (const candidate of candidates) {
+			if (tokenLooksLikeAbsolutePath(candidate)) {
+				return '<REDACTED: user-file-path>';
+			}
+			const secret = detectSecret(candidate);
+			if (secret) {
+				return `<REDACTED: ${secret}>`;
+			}
 		}
-		if (/^\/(?:Users|home|tmp|private\/tmp)\//.test(canonical)) {
-			return '<REDACTED: user-file-path>';
+		if (candidates.some(tokenLooksLikeUserContent)) {
+			return `<REDACTED: content:${simpleHashPrefix(canonical)}>`;
 		}
 		return token;
 	});
+
 	// Secret pass with placeholder protection so a label like "GitHub Token"
 	// is not re-matched by the Generic Secret `(token)[^A-Za-z0-9]` heuristic.
 	const held: string[] = [];
@@ -547,6 +729,13 @@ export function scrubPersistedExtensionHostLogLine(line: string): string {
 		out = out.replace(entry.regex, () => hold(`<REDACTED: ${entry.label}>`));
 	}
 	out = out.replace(/\0H(\d+)\0/g, (_, i) => held[Number(i)] ?? '');
+
+	// Fail closed: if the line still carries an absolute path shape, hash it.
+	const residualCanonical = canonicalizeTelemetryString(out);
+	if (ABS_PATH_RE.test(residualCanonical) || ABS_UNIX_SENSITIVE_ROOT_RE.test(residualCanonical) || ABS_WIN_ANY_DRIVE_RE.test(residualCanonical)) {
+		const prefix = out.slice(0, 80).replace(/\s+/g, ' ');
+		return `${prefix.slice(0, 40)}… <REDACTED: line:${simpleHashPrefix(line)}>`;
+	}
 	return out;
 }
 

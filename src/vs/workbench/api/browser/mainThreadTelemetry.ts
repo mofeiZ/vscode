@@ -63,7 +63,13 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 				}
 			}));
 		}
-		this._proxy.$initializeTelemetryLevel(this.telemetryLevel, supportsTelemetry(this._productService, this._environmentService), this._productService.enabledTelemetryLevels);
+		// sr1#3: propagate session canary so Path B `_dataGuardMarkers` includes it.
+		this._proxy.$initializeTelemetryLevel(
+			this.telemetryLevel,
+			supportsTelemetry(this._productService, this._environmentService),
+			this._productService.enabledTelemetryLevels,
+			this._sessionCanary,
+		);
 	}
 
 	private _refreshDataGuardMarkers(): void {

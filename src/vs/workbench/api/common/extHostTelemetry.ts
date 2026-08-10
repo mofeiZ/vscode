@@ -42,6 +42,8 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 	private readonly _outputLogger: ILogger;
 	private readonly _dataGuardLogger: ILogger;
 	private readonly _telemetryLoggers = new Map<string, ExtHostTelemetryLogger[]>();
+	/** Session canary from MainThreadTelemetry (sr1#3); included in Path B markers. */
+	private _dataGuardCanary: string | undefined;
 
 	constructor(
 		isWorker: boolean,
@@ -71,7 +73,11 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 
 	private _dataGuardMarkers(): string[] {
 		const folders = this.extHostWorkspace.getWorkspaceFolders() ?? [];
-		return folders.map(f => f.uri.fsPath);
+		const markers = folders.map(f => f.uri.fsPath);
+		if (typeof this._dataGuardCanary === 'string' && this._dataGuardCanary.length > 0) {
+			markers.push(this._dataGuardCanary);
+		}
+		return markers;
 	}
 
 	getTelemetryConfiguration(): boolean {
@@ -104,9 +110,12 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 		return logger.apiTelemetryLogger;
 	}
 
-	$initializeTelemetryLevel(level: TelemetryLevel, supportsTelemetry: boolean, productConfig?: { usage: boolean; error: boolean }): void {
+	$initializeTelemetryLevel(level: TelemetryLevel, supportsTelemetry: boolean, productConfig?: { usage: boolean; error: boolean }, dataGuardCanary?: string): void {
 		this._level = level;
 		this._productConfig = productConfig ?? { usage: true, error: true };
+		if (typeof dataGuardCanary === 'string' && dataGuardCanary.length > 0) {
+			this._dataGuardCanary = dataGuardCanary;
+		}
 	}
 
 	getBuiltInCommonProperties(extension: IExtensionDescription): ICommonProperties {

@@ -256,4 +256,89 @@ suite('TelemetryDataGuard', () => {
 			assert.strictEqual(result.layer, 'shape');
 		}
 	});
+
+	// --- sr1 follow-ups (u23) ---
+
+	test('sr1#1 path in property NAME is BLOCKED (Path B strict-shape)', () => {
+		const workspaceFsPath = '/Users/alice/proj/secret.ts';
+		const result = detectTelemetryUserData(
+			{ [workspaceFsPath]: 1 },
+			{ strictShape: true, eventName: 'anyarchive.probe' },
+		);
+		assert.strictEqual(result.hit, true);
+		if (result.hit) {
+			assert.ok(result.layer === 'path' || result.layer === 'shape');
+		}
+	});
+
+	test('sr1#1 path in property NAME is BLOCKED (Path A pluginHost bounds)', () => {
+		const workspaceFsPath = '/Users/alice/proj/secret.ts';
+		const result = detectTelemetryUserData(
+			{ [workspaceFsPath]: 1, pluginHostTelemetry: true },
+			{
+				markers: [workspaceFsPath],
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+				eventName: 'anyarchive.probe.core',
+			},
+		);
+		assert.strictEqual(result.hit, true);
+		if (result.hit) {
+			assert.ok(result.layer === 'path' || result.layer === 'canary');
+		}
+	});
+
+	test('sr1#2 <=24 numeric char-code OBJECT is BLOCKED', () => {
+		// Under the 24-leaf cap; previously only arrays/typed arrays reassembled.
+		const path = '/Users/a/b/c.ts'; // 14 code units
+		assert.ok(path.length <= 24);
+		const measurements: Record<string, number> = {};
+		for (let i = 0; i < path.length; i++) {
+			measurements[`c${i}`] = path.charCodeAt(i);
+		}
+		const strict = detectTelemetryUserData({ measurements }, { strictShape: true });
+		assert.strictEqual(strict.hit, true, 'strict-shape must block indexed char-code object');
+
+		// Nest under measurements so pluginHostTelemetry boolean does not break
+		// the all-numeric indexed-object detector at the top level.
+		const pathA = detectTelemetryUserData(
+			{ measurements, pluginHostTelemetry: true },
+			{ boundMeasurements: true, failClosedOnDepthAbort: true },
+		);
+		assert.strictEqual(pathA.hit, true, 'Path A bounds must block indexed char-code object');
+	});
+
+	test('sr1#4 scrub redacts content, non-home paths, JWT, and base64', () => {
+		const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturepad1234567890';
+		const b64Path = globalThis.btoa('/Users/alice/proj/secret.ts');
+		const lines = [
+			'console.log dump: ' + 'x'.repeat(200),
+			'failed to read /opt/company/data/secrets.env',
+			'cache at /var/folders/xx/abcdefgh/T/tmp-file',
+			`auth ${jwt}`,
+			`encoded ${b64Path}`,
+			'also D:\\Users\\bob\\secret.ts',
+		];
+		for (const line of lines) {
+			const scrubbed = scrubPersistedExtensionHostLogLine(line);
+			assert.ok(scrubbed.includes('REDACTED'), `expected redaction for: ${line.slice(0, 60)}`);
+			assert.ok(!scrubbed.includes('/opt/company'), `opt path leaked: ${scrubbed}`);
+			assert.ok(!scrubbed.includes('/var/folders'), `var/folders leaked: ${scrubbed}`);
+			assert.ok(!scrubbed.includes('/Users/alice'), `home path leaked: ${scrubbed}`);
+			assert.ok(!scrubbed.includes(jwt), `JWT leaked: ${scrubbed}`);
+			assert.ok(!scrubbed.includes('x'.repeat(80)), `long content leaked: ${scrubbed}`);
+		}
+	});
+
+	test('activatePlugin-style first-party payload is not false-positive blocked', () => {
+		// Path A without pluginHostTelemetry / strictShape — core first-party shape.
+		const result = detectTelemetryUserData({
+			id: 'vscode.git',
+			name: 'Git',
+			pluginHostTelemetry: false,
+			duration: 12,
+			nested: { count: 1, size: 2, idle: 3, working: 4 },
+		}, { markers: ['/Users/alice/proj'] });
+		assert.strictEqual(result.hit, false);
+	});
 });

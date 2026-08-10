@@ -267,6 +267,11 @@ export class TelemetryService implements ITelemetryService {
 			if (pluginHostTelemetry) {
 				return;
 			}
+			// TUNING DEBT (sr1#5 / intentional): for core (non-pluginHost) events we
+			// log the violation but still forward to appenders after cleanData below.
+			// Do not change this to fail-closed without retuning the guard for
+			// first-party stacks — extensions cannot strip pluginHostTelemetry on
+			// IPC, so Path B / pluginHost Path A remain the hard block surface.
 		}
 
 		// remove all PII from data (includes common properties after G3 reorder)
