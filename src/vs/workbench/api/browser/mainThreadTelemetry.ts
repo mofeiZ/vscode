@@ -100,8 +100,8 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 		// __GDPR__COMMON__ "pluginHostTelemetry" : { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true }
 		data[MainThreadTelemetry._name] = true;
 
-		// Per-EH memory events: stamp affinity/host id main-thread-side (EH does not know it).
-		if (eventName === 'exthostMemorySample' || eventName === 'exthostMemoryAlert') {
+		// Per-EH memory / heap-attribution events: stamp affinity main-thread-side (EH does not know it).
+		if (eventName === 'exthostMemorySample' || eventName === 'exthostMemoryAlert' || eventName === 'exthostHeapAttribution') {
 			data['affinity'] = this._affinity;
 		}
 

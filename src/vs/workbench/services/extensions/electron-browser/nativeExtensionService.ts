@@ -53,11 +53,12 @@ import {
 	writePendingExtensionHostCrashRecord,
 	type ExtensionHostCrashRecord,
 } from '../common/extensionHostCrashRecord.js';
+import { inspectNearHeapLimitSnapshots } from '../common/extensionHostHeapWiring.js';
 import { ExtensionHostKind, ExtensionRunningPreference, IExtensionHostKindPicker, extensionHostKindToString, extensionRunningPreferenceToString } from '../common/extensionHostKind.js';
 import { IExtensionHostManager } from '../common/extensionHostManagers.js';
 import { ExtensionHostExitCode } from '../common/extensionHostProtocol.js';
 import { IExtensionManifestPropertiesService } from '../common/extensionManifestPropertiesService.js';
-import { ExtensionRunningLocation, LocalProcessRunningLocation, LocalWebWorkerRunningLocation } from '../common/extensionRunningLocation.js';
+import { ExtensionRunningLocation, LocalProcessRunningLocation, LocalWebWorkerRunningLocation, localProcessExtensionHostLogsPath } from '../common/extensionRunningLocation.js';
 import { ExtensionRunningLocationTracker, filterExtensionDescriptions } from '../common/extensionRunningLocationTracker.js';
 import { ExtensionHostExtensions, ExtensionHostStartup, IExtensionHost, IExtensionService, WebWorkerExtHostConfigValue, toExtension, webWorkerExtHostConfig } from '../common/extensions.js';
 import { ExtensionsProposedApi } from '../common/extensionsProposedApi.js';
@@ -308,24 +309,96 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 				lastRssBucketMb: null,
 			});
 		const extensionIds = activatedExtensions.map(e => e.value);
-		const record = buildExtensionHostCrashRecord({
-			ts: Date.now(),
+		const affinity = ctx?.affinity ?? 0;
+		const uptimeSec = ctx?.uptimeSec ?? 0;
+		const ts = Date.now();
+		const hostStartedAtMs = uptimeSec > 0 ? ts - uptimeSec * 1000 : 0;
+		const userDataHome = URI.file(this._environmentService.userDataPath);
+		void this._scanNearHeapSnapshotAndPersist(userDataHome, {
+			ts,
 			code,
 			signal: signal ?? 'unknown',
 			reason,
 			classification,
-			affinity: ctx?.affinity ?? 0,
+			affinity,
 			pid: ctx?.pid ?? extensionHost.pid ?? 0,
-			uptimeSec: ctx?.uptimeSec ?? 0,
+			uptimeSec,
 			lastRssBucketMb: ctx?.lastRssBucketMb ?? null,
 			lastHeapUsedMb: ctx?.lastHeapUsedMb ?? null,
 			secondsSinceLastSample: ctx?.secondsSinceLastSample ?? null,
 			secondsSinceLastAlert: ctx?.secondsSinceLastAlert ?? null,
 			extensionIds,
+			hostStartedAtMs,
+			exitContextHeapSnapshotCaptured: ctx?.heapSnapshotCaptured,
+			exitContextHeapSnapshotSizeBucketMb: ctx?.heapSnapshotSizeBucketMb,
 		});
+	}
 
-		const userDataHome = URI.file(this._environmentService.userDataPath);
-		void this._writePendingCrashRecordAndEmit(userDataHome, record);
+	private async _scanNearHeapSnapshotAndPersist(
+		userDataHome: URI,
+		args: {
+			readonly ts: number;
+			readonly code: number;
+			readonly signal: string;
+			readonly reason: string;
+			readonly classification: ReturnType<typeof classifyExtensionHostExit>;
+			readonly affinity: number;
+			readonly pid: number;
+			readonly uptimeSec: number;
+			readonly lastRssBucketMb: number | null;
+			readonly lastHeapUsedMb: number | null;
+			readonly secondsSinceLastSample: number | null;
+			readonly secondsSinceLastAlert: number | null;
+			readonly extensionIds: readonly string[];
+			readonly hostStartedAtMs: number;
+			readonly exitContextHeapSnapshotCaptured?: boolean;
+			readonly exitContextHeapSnapshotSizeBucketMb?: number | null;
+		},
+	): Promise<void> {
+		let heapSnapshotCaptured = args.exitContextHeapSnapshotCaptured === true;
+		let heapSnapshotSizeBucketMb = typeof args.exitContextHeapSnapshotSizeBucketMb === 'number'
+			? args.exitContextHeapSnapshotSizeBucketMb
+			: null;
+		if (!heapSnapshotCaptured) {
+			try {
+				const hostLogsPath = localProcessExtensionHostLogsPath(this._environmentService.extHostLogsPath, args.affinity);
+				const stat = await this._fileService.resolve(hostLogsPath);
+				const entries = [];
+				for (const child of stat.children ?? []) {
+					if (child.isDirectory) {
+						continue;
+					}
+					entries.push({
+						name: child.name,
+						sizeBytes: typeof child.size === 'number' ? child.size : 0,
+						mtimeMs: typeof child.mtime === 'number' ? child.mtime : args.ts,
+					});
+				}
+				const scanned = inspectNearHeapLimitSnapshots(entries, args.hostStartedAtMs);
+				heapSnapshotCaptured = scanned.heapSnapshotCaptured;
+				heapSnapshotSizeBucketMb = scanned.heapSnapshotSizeBucketMb;
+			} catch {
+				// diagnostic dir may be missing; leave numbers-only defaults
+			}
+		}
+		const record = buildExtensionHostCrashRecord({
+			ts: args.ts,
+			code: args.code,
+			signal: args.signal,
+			reason: args.reason,
+			classification: args.classification,
+			affinity: args.affinity,
+			pid: args.pid,
+			uptimeSec: args.uptimeSec,
+			lastRssBucketMb: args.lastRssBucketMb,
+			lastHeapUsedMb: args.lastHeapUsedMb,
+			secondsSinceLastSample: args.secondsSinceLastSample,
+			secondsSinceLastAlert: args.secondsSinceLastAlert,
+			extensionIds: args.extensionIds,
+			heapSnapshotCaptured,
+			heapSnapshotSizeBucketMb,
+		});
+		await this._writePendingCrashRecordAndEmit(userDataHome, record);
 	}
 
 	private async _writePendingCrashRecordAndEmit(userDataHome: URI, record: ExtensionHostCrashRecord): Promise<void> {
