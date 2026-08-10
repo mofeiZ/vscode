@@ -11,6 +11,7 @@ import { Disposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import * as objects from '../../../../base/common/objects.js';
 import * as platform from '../../../../base/common/platform.js';
 import { removeDangerousEnvVariables } from '../../../../base/common/processes.js';
+import { joinPath } from '../../../../base/common/resources.js';
 import { StopWatch } from '../../../../base/common/stopwatch.js';
 import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
@@ -21,7 +22,7 @@ import * as nls from '../../../../nls.js';
 import { IExtensionHostDebugService } from '../../../../platform/debug/common/extensionHostDebug.js';
 import { extensionHostGraceTimeMs, IExtensionHostProcessOptions, IExtensionHostStarter } from '../../../../platform/extensions/common/extensionHostStarter.js';
 import { ILabelService } from '../../../../platform/label/common/label.js';
-import { ILogService, ILoggerService } from '../../../../platform/log/common/log.js';
+import { ILogService, ILogger, ILoggerService } from '../../../../platform/log/common/log.js';
 import { INativeHostService } from '../../../../platform/native/common/native.js';
 import { INotificationService, NotificationPriority, Severity } from '../../../../platform/notification/common/notification.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
@@ -118,6 +119,7 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 	private _inspectListener: IExtensionInspectInfo | null;
 	private _extensionHostProcess: ExtensionHostProcess | null;
 	private _messageProtocol: Promise<IMessagePassingProtocol> | null;
+	private _ehProcessLog: ILogger | null = null;
 
 	constructor(
 		public readonly runningLocation: LocalProcessRunningLocation,
@@ -294,20 +296,30 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			Event.map(onStderr.event, o => ({ data: `%c${o}`, format: ['color: red'] }))
 		);
 
-		// Persist the raw extension host process output (stdout/stderr) to the
-		// renderer log. The output is otherwise only forwarded (debounced) to the
-		// renderer DevTools console. A native crash of the extension host process
-		// - e.g. a faulty native addon - prints to the process' stderr but never
-		// reaches the JavaScript layer, so it has no JS stack and (for utility
-		// processes) frequently produces no crash dump; it also cannot go through
-		// the extension host's own log service, which lives in the dying process.
-		// Capturing the raw output from the (surviving) renderer keeps such
-		// crashes diagnosable from the logs. Gated to smoke tests
-		// (`--enable-smoke-test-driver`) so it does not affect regular sessions.
-		if (this._environmentService.args['enable-smoke-test-driver']) {
-			this._register(onStdout.event(line => this._logService.info(`[Extension Host (stdout)] ${line.replace(/\r?\n$/, '')}`)));
-			this._register(onStderr.event(line => this._logService.error(`[Extension Host (stderr)] ${line.replace(/\r?\n$/, '')}`)));
-		}
+		// Persist the raw extension host process output (stdout/stderr) to a
+		// durable file under the exthost log directory. The output is otherwise
+		// only forwarded (debounced) to the renderer DevTools console. A native
+		// crash of the extension host process - e.g. a faulty native addon -
+		// prints to the process' stderr but never reaches the JavaScript layer,
+		// so it has no JS stack and (for utility processes) frequently produces
+		// no crash dump; it also cannot go through the extension host's own log
+		// service, which lives in the dying process. Capturing the raw output
+		// from the (surviving) renderer keeps such crashes diagnosable from the
+		// logs without requiring `--enable-smoke-test-driver`.
+		const ehProcessLog = this._register(this._loggerService.createLogger(
+			joinPath(this._environmentService.extHostLogsPath, 'exthost-stderr.log'),
+			{
+				id: 'exthostStderr',
+				name: nls.localize('exthostStderr', "Extension Host Stderr"),
+				logLevel: 'always',
+				hidden: true,
+			}
+		));
+		this._ehProcessLog = ehProcessLog;
+		this._register(onStdout.event(line => ehProcessLog.info(`[stdout] ${line.replace(/\r?\n$/, '')}`)));
+		this._register(onStderr.event(line => ehProcessLog.error(`[stderr] ${line.replace(/\r?\n$/, '')}`)));
+		// Also leave a breadcrumb in the window log for discoverability.
+		this._register(onStderr.event(line => this._logService.error(`[Extension Host (stderr)] ${line.replace(/\r?\n$/, '')}`)));
 
 		// Debounce all output, so we can render it in the Chrome console as a group
 		const onDebouncedOutput = Event.debounce<Output>(onOutput, (r, o) => {
@@ -587,6 +599,10 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			// Expected termination path (we asked the process to terminate)
 			return;
 		}
+
+		// Structured crash breadcrumb into the exthost log directory so unexpected
+		// EH deaths remain visible even when no stderr was flushed.
+		this._ehProcessLog?.error(`Extension host exited unexpectedly: code=${code} signal=${signal} pid=${this.pid}`);
 
 		this._onExit.fire([code, signal]);
 	}
