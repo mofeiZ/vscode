@@ -24,20 +24,29 @@ import { ExtensionHostKind, IExtensionHostKindPicker } from '../../common/extens
 import { IExtensionManifestPropertiesService } from '../../common/extensionManifestPropertiesService.js';
 import { IReadOnlyExtensionDescriptionRegistry } from '../../common/extensionDescriptionRegistry.js';
 import { localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../../common/extensionRunningLocation.js';
+import {
+	_setTrustBucketingEnabledForTests,
+	isTrustBucketingEnabled,
+	isTrustedExtension,
+	THIRD_PARTY_BUCKET_AFFINITY,
+} from '../../common/extensionTrustBuckets.js';
 import { IWorkbenchEnvironmentService } from '../../../environment/common/environmentService.js';
 
-function createExtension(id: string, deps?: string[], extensionAffinity?: string[]): IExtensionDescription {
+function createExtension(id: string, deps?: string[], extensionAffinity?: string[], opts?: { isBuiltin?: boolean; isUserBuiltin?: boolean; publisher?: string }): IExtensionDescription {
+	const publisher = opts?.publisher ?? (id.includes('.') ? id.split('.')[0] : 'test');
 	return <IExtensionDescription>{
 		identifier: new ExtensionIdentifier(id),
 		extensionLocation: URI.parse(`file:///test/${id}`),
 		name: id,
-		publisher: 'test',
+		publisher,
 		version: '1.0.0',
 		engines: { vscode: '*' },
 		main: 'main.js',
 		extensionDependencies: deps,
 		extensionAffinity: extensionAffinity,
 		enabledApiProposals: extensionAffinity ? ['extensionAffinity'] : undefined,
+		isBuiltin: opts?.isBuiltin ?? false,
+		isUserBuiltin: opts?.isUserBuiltin ?? false,
 	};
 }
 
@@ -389,5 +398,195 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		assert.strictEqual(localProcessExtensionHostLogsPath(base, 2).fsPath, '/tmp/logs/window1/exthost2');
 		assert.strictEqual(localProcessExtensionHostLogId('exthostStderr', 0), 'exthostStderr');
 		assert.strictEqual(localProcessExtensionHostLogId('exthostStderr', 1), 'exthostStderr.1');
+	});
+});
+
+suite('ExtensionRunningLocationTracker - trust bucketing', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	setup(() => {
+		_setInternalDiagnosticsEnabledForTests(false);
+		_setTrustBucketingEnabledForTests(undefined);
+	});
+
+	teardown(() => {
+		_resetDiagnosticIsolationForTests();
+		_setInternalDiagnosticsEnabledForTests(undefined);
+		_setTrustBucketingEnabledForTests(undefined);
+	});
+
+	function createTracker(
+		extensions: IExtensionDescription[],
+		configuredAffinities: { [extensionId: string]: number } = {},
+		isExtensionDevelopment = false,
+	): ExtensionRunningLocationTracker {
+		const registry: IReadOnlyExtensionDescriptionRegistry = {
+			getAllExtensionDescriptions: () => extensions,
+			getExtensionDescription: (id: string | ExtensionIdentifier) => extensions.find(e => e.identifier.value === (typeof id === 'string' ? id : id.value)),
+			getExtensionDescriptionByUUID: () => undefined,
+			getExtensionDescriptionByIdOrUUID: () => undefined,
+			containsActivationEvent: () => false,
+			containsExtension: () => false,
+			getExtensionDescriptionsForActivationEvent: () => [],
+		};
+
+		const extensionHostKindPicker: IExtensionHostKindPicker = {
+			pickExtensionHostKind: () => ExtensionHostKind.LocalProcess,
+		};
+
+		const environmentService = <IWorkbenchEnvironmentService>{
+			isExtensionDevelopment,
+			extensionDevelopmentKind: undefined,
+		};
+
+		const configurationService = new TestConfigurationService();
+		configurationService.setUserConfiguration('extensions.experimental.affinity', configuredAffinities);
+
+		const logService = new NullLogService();
+		const extensionManifestPropertiesService = {
+			getExtensionKind: () => ['workspace'],
+		} as unknown as IExtensionManifestPropertiesService;
+
+		return new ExtensionRunningLocationTracker(
+			registry,
+			extensionHostKindPicker,
+			environmentService,
+			configurationService,
+			logService,
+			extensionManifestPropertiesService
+		);
+	}
+
+	test('isTrustedExtension: builtins trusted, userBuiltin and marketplace not', () => {
+		const builtin = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const userBuiltin = createExtension('my.sideload', undefined, undefined, { isBuiltin: true, isUserBuiltin: true });
+		const marketplace = createExtension('eamodio.gitlens');
+		assert.strictEqual(isTrustedExtension(builtin), true);
+		assert.strictEqual(isTrustedExtension(userBuiltin), false);
+		assert.strictEqual(isTrustedExtension(marketplace), false);
+		assert.strictEqual(isTrustedExtension(marketplace, { trustedPublishers: ['eamodio'] }), true);
+		assert.strictEqual(isTrustedExtension(marketplace, { trustedExtensionIds: ['eamodio.gitlens'] }), true);
+	});
+
+	test('flag OFF: builtin and marketplace stay on affinity 0 (no topology change)', () => {
+		_setTrustBucketingEnabledForTests(false);
+		assert.strictEqual(isTrustBucketingEnabled(), false);
+
+		const builtin = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const marketplace = createExtension('publisher.prettier');
+
+		const tracker = createTracker([builtin, marketplace]);
+		const runningLocations = tracker.computeRunningLocation([builtin, marketplace], [], true);
+
+		assert.strictEqual(runningLocations.get(builtin.identifier)!.affinity, 0);
+		assert.strictEqual(runningLocations.get(marketplace.identifier)!.affinity, 0);
+	});
+
+	test('flag ON: builtin and marketplace land on different affinities', () => {
+		_setTrustBucketingEnabledForTests(true);
+
+		const builtin = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const marketplace = createExtension('publisher.prettier');
+
+		const tracker = createTracker([builtin, marketplace]);
+		tracker.initializeRunningLocation([builtin, marketplace], []);
+
+		assert.strictEqual(tracker.getRunningLocation(builtin.identifier)!.affinity, 0, 'builtin stays on trusted host');
+		assert.strictEqual(tracker.getRunningLocation(marketplace.identifier)!.affinity, THIRD_PARTY_BUCKET_AFFINITY, 'marketplace on third-party host');
+		assert.strictEqual(tracker.maxLocalProcessAffinity, THIRD_PARTY_BUCKET_AFFINITY);
+	});
+
+	test('flag ON: dependency group stays together (dilutes trusted into 3P host)', () => {
+		_setTrustBucketingEnabledForTests(true);
+
+		const sharedApi = createExtension('vscode.sharedApi', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const consumer = createExtension('publisher.consumer', ['vscode.sharedApi']);
+		const unrelated = createExtension('publisher.unrelated');
+
+		const tracker = createTracker([sharedApi, consumer, unrelated]);
+		const runningLocations = tracker.computeRunningLocation([sharedApi, consumer, unrelated], [], true);
+
+		const locShared = runningLocations.get(sharedApi.identifier)!;
+		const locConsumer = runningLocations.get(consumer.identifier)!;
+		const locUnrelated = runningLocations.get(unrelated.identifier)!;
+
+		assert.strictEqual(locShared.affinity, locConsumer.affinity, 'dependency group must not be split');
+		assert.strictEqual(locShared.affinity, THIRD_PARTY_BUCKET_AFFINITY, 'mixed group goes to third-party bucket');
+		assert.strictEqual(locUnrelated.affinity, THIRD_PARTY_BUCKET_AFFINITY);
+	});
+
+	test('flag ON: vscode.git API consumer (GitLens) co-locates with vscode.git', () => {
+		_setTrustBucketingEnabledForTests(true);
+
+		const git = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const gitBase = createExtension('vscode.git-base', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const gitlens = createExtension('eamodio.gitlens');
+		const prettier = createExtension('esbenp.prettier-vscode');
+
+		const tracker = createTracker([git, gitBase, gitlens, prettier]);
+		const runningLocations = tracker.computeRunningLocation([git, gitBase, gitlens, prettier], [], true);
+
+		const locGit = runningLocations.get(git.identifier)!;
+		const locGitBase = runningLocations.get(gitBase.identifier)!;
+		const locGitlens = runningLocations.get(gitlens.identifier)!;
+		const locPrettier = runningLocations.get(prettier.identifier)!;
+
+		assert.strictEqual(locGit.affinity, 0);
+		assert.strictEqual(locGitBase.affinity, 0);
+		assert.strictEqual(locGitlens.affinity, locGit.affinity, 'GitLens must co-locate with vscode.git');
+		assert.strictEqual(locPrettier.affinity, THIRD_PARTY_BUCKET_AFFINITY, 'unrelated 3P still split');
+		assert.notStrictEqual(locGitlens.affinity, locPrettier.affinity);
+	});
+
+	test('flag ON: zero third-party extensions ⇒ maxAffinity 0 (no extra host)', () => {
+		_setTrustBucketingEnabledForTests(true);
+
+		const git = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const theme = createExtension('vscode.theme-defaults', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+
+		const tracker = createTracker([git, theme]);
+		tracker.initializeRunningLocation([git, theme], []);
+
+		assert.strictEqual(tracker.getRunningLocation(git.identifier)!.affinity, 0);
+		assert.strictEqual(tracker.getRunningLocation(theme.identifier)!.affinity, 0);
+		assert.strictEqual(tracker.maxLocalProcessAffinity, 0);
+	});
+
+	test('flag ON: isExtensionDevelopment skips trust bucketing', () => {
+		_setTrustBucketingEnabledForTests(true);
+
+		const builtin = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const marketplace = createExtension('publisher.prettier');
+
+		const tracker = createTracker([builtin, marketplace], {}, true);
+		const runningLocations = tracker.computeRunningLocation([builtin, marketplace], [], true);
+
+		assert.strictEqual(runningLocations.get(builtin.identifier)!.affinity, 0);
+		assert.strictEqual(runningLocations.get(marketplace.identifier)!.affinity, 0);
+	});
+
+	test('flag ON: diagnostic isolation further isolates a third-party suspect', () => {
+		_setTrustBucketingEnabledForTests(true);
+		_setInternalDiagnosticsEnabledForTests(true);
+
+		const builtin = createExtension('vscode.git', undefined, undefined, { isBuiltin: true, publisher: 'vscode' });
+		const suspect = createExtension('publisher.suspect');
+		const other3p = createExtension('publisher.other');
+
+		addDiagnosticIsolation('publisher.suspect');
+
+		const tracker = createTracker([builtin, suspect, other3p]);
+		const runningLocations = tracker.computeRunningLocation([builtin, suspect, other3p], [], true);
+
+		const locBuiltin = runningLocations.get(builtin.identifier)!;
+		const locSuspect = runningLocations.get(suspect.identifier)!;
+		const locOther = runningLocations.get(other3p.identifier)!;
+
+		assert.strictEqual(locBuiltin.affinity, 0, 'trusted baseline');
+		assert.ok(locOther.affinity > 0, 'ordinary 3P on a non-trusted host');
+		assert.ok(locSuspect.affinity > 0, 'suspect isolated');
+		assert.notStrictEqual(locSuspect.affinity, locOther.affinity, 'diagnostic isolation is a further host beyond the 3P bucket');
+		assert.notStrictEqual(locSuspect.affinity, locBuiltin.affinity);
 	});
 });
