@@ -4,13 +4,19 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Disposable } from '../../../base/common/lifecycle.js';
+import { joinPath } from '../../../base/common/resources.js';
+import { generateUuid } from '../../../base/common/uuid.js';
 import { IConfigurationService } from '../../../platform/configuration/common/configuration.js';
 import { CommandsRegistry } from '../../../platform/commands/common/commands.js';
 import { IEnvironmentService } from '../../../platform/environment/common/environment.js';
+import { ILogger, ILoggerService } from '../../../platform/log/common/log.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
 import { ClassifiedEvent, IGDPRProperty, OmitMetadata, StrictPropertyCheck } from '../../../platform/telemetry/common/gdprTypings.js';
 import { ITelemetryService, TelemetryLevel, TELEMETRY_OLD_SETTING_ID, TELEMETRY_SETTING_ID, ITelemetryData } from '../../../platform/telemetry/common/telemetry.js';
+import { detectTelemetryUserData, formatTelemetryGuardViolation } from '../../../platform/telemetry/common/telemetryDataGuard.js';
 import { supportsTelemetry } from '../../../platform/telemetry/common/telemetryUtils.js';
+import { IWorkspaceContextService } from '../../../platform/workspace/common/workspace.js';
+import { IWorkbenchEnvironmentService } from '../../services/environment/common/environmentService.js';
 import { extHostNamedCustomer, IExtHostContext } from '../../services/extensions/common/extHostCustomers.js';
 import { ExtHostContext, ExtHostTelemetryShape, MainContext, MainThreadTelemetryShape } from '../common/extHost.protocol.js';
 
@@ -20,16 +26,35 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 
 	private static readonly _name = 'pluginHostTelemetry';
 
+	private readonly _sessionCanary: string;
+	private readonly _dataGuardLogger: ILogger;
+
 	constructor(
 		extHostContext: IExtHostContext,
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
 		@IEnvironmentService private readonly _environmentService: IEnvironmentService,
 		@IProductService private readonly _productService: IProductService,
+		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
+		@IWorkbenchEnvironmentService private readonly _workbenchEnvironmentService: IWorkbenchEnvironmentService,
+		@ILoggerService loggerService: ILoggerService,
 	) {
 		super();
 
 		this._proxy = extHostContext.getProxy(ExtHostContext.ExtHostTelemetry);
+		this._sessionCanary = `ANYARCHIVE_TEL_CANARY_${generateUuid()}`;
+		this._dataGuardLogger = this._register(loggerService.createLogger(
+			joinPath(this._workbenchEnvironmentService.extHostLogsPath, 'telemetry-guard.log'),
+			{
+				id: 'telemetryDataGuardMain',
+				name: 'Telemetry Data Guard',
+				logLevel: 'always',
+				hidden: true,
+			}
+		));
+
+		this._refreshDataGuardMarkers();
+		this._register(this._workspaceContextService.onDidChangeWorkspaceFolders(() => this._refreshDataGuardMarkers()));
 
 		if (supportsTelemetry(this._productService, this._environmentService)) {
 			this._register(this._configurationService.onDidChangeConfiguration(e => {
@@ -39,6 +64,11 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 			}));
 		}
 		this._proxy.$initializeTelemetryLevel(this.telemetryLevel, supportsTelemetry(this._productService, this._environmentService), this._productService.enabledTelemetryLevels);
+	}
+
+	private _refreshDataGuardMarkers(): void {
+		const folderPaths = this._workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath);
+		this._telemetryService.setDataGuardMarkers?.([...folderPaths, this._sessionCanary]);
 	}
 
 	private get telemetryLevel(): TelemetryLevel {
@@ -52,6 +82,25 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 	$publicLog(eventName: string, data: ITelemetryData = Object.create(null)): void {
 		// __GDPR__COMMON__ "pluginHostTelemetry" : { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true }
 		data[MainThreadTelemetry._name] = true;
+
+		// Pre-check so EH IPC violations are attributed here even if core telemetry is Null.
+		const markers = [
+			...this._workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath),
+			this._sessionCanary,
+		];
+		const guard = detectTelemetryUserData(data, markers);
+		if (guard.hit) {
+			this._dataGuardLogger.info(formatTelemetryGuardViolation({
+				timestamp: new Date().toISOString(),
+				eventName,
+				layer: guard.layer,
+				detail: guard.detail,
+				pluginHostTelemetry: true,
+				pipe: 'core',
+			}));
+			return;
+		}
+
 		this._telemetryService.publicLog(eventName, data);
 	}
 
@@ -99,4 +148,46 @@ CommandsRegistry.registerCommand(SET_CAPI_ASSIGNMENT_CONTEXT_COMMAND, function (
 	}
 
 	accessor.get(ITelemetryService).setExperimentProperty(CAPI_ASSIGNMENT_CONTEXT_PROPERTY, value);
+});
+
+/**
+ * Dev/demo hook: extensions invoke this to exercise Path A
+ * (ITelemetryService._doLog with pluginHostTelemetry) with a deliberate
+ * user-data payload. Not part of the public API.
+ */
+export const PROBE_DATA_GUARD_PUBLIC_LOG_COMMAND = '_telemetry.probeDataGuardPublicLog';
+
+CommandsRegistry.registerCommand(PROBE_DATA_GUARD_PUBLIC_LOG_COMMAND, function (accessor, data?: ITelemetryData) {
+	const telemetry = accessor.get(ITelemetryService);
+	const env = accessor.get(IWorkbenchEnvironmentService);
+	const loggerService = accessor.get(ILoggerService);
+	const workspace = accessor.get(IWorkspaceContextService);
+	const payload: ITelemetryData = {
+		...(data && typeof data === 'object' ? data : {}),
+		pluginHostTelemetry: true,
+	};
+	const markers = workspace.getWorkspace().folders.map(f => f.uri.fsPath);
+	const guard = detectTelemetryUserData(payload, markers);
+	if (guard.hit) {
+		const logger = loggerService.createLogger(
+			joinPath(env.extHostLogsPath, 'telemetry-guard.log'),
+			{
+				id: 'telemetryDataGuardProbe',
+				name: 'Telemetry Data Guard',
+				logLevel: 'always',
+				hidden: true,
+			}
+		);
+		logger.info(formatTelemetryGuardViolation({
+			timestamp: new Date().toISOString(),
+			eventName: 'anyarchive.probe.core',
+			layer: guard.layer,
+			detail: guard.detail,
+			pluginHostTelemetry: true,
+			pipe: 'core',
+		}));
+		return { blocked: true, layer: guard.layer };
+	}
+	telemetry.publicLog('anyarchive.probe.core', payload);
+	return { blocked: false };
 });

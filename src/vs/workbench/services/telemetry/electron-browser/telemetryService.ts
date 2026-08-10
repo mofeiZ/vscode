@@ -5,8 +5,10 @@
 
 import { ITelemetryService, ITelemetryData, TelemetryLevel } from '../../../../platform/telemetry/common/telemetry.js';
 import { supportsTelemetry, NullTelemetryService, getPiiPathsFromEnvironment, isInternalTelemetry } from '../../../../platform/telemetry/common/telemetryUtils.js';
+import { formatTelemetryGuardViolation } from '../../../../platform/telemetry/common/telemetryDataGuard.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { joinPath } from '../../../../base/common/resources.js';
 import { INativeWorkbenchEnvironmentService } from '../../environment/electron-browser/environmentService.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { ISharedProcessService } from '../../../../platform/ipc/electron-browser/services.js';
@@ -19,6 +21,7 @@ import { ClassifiedEvent, StrictPropertyCheck, OmitMetadata, IGDPRProperty } fro
 import { process } from '../../../../base/parts/sandbox/electron-browser/globals.js';
 import { experimentsEnabled } from '../common/workbenchTelemetryUtils.js';
 import { IRequestService, NO_FETCH_TELEMETRY } from '../../../../platform/request/common/request.js';
+import { ILogger, ILoggerService } from '../../../../platform/log/common/log.js';
 
 export class TelemetryService extends Disposable implements ITelemetryService {
 
@@ -34,19 +37,31 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 	get firstSessionDate(): string { return this.impl.firstSessionDate; }
 	get msftInternal(): boolean | undefined { return this.impl.msftInternal; }
 
+	private _dataGuardLogger: ILogger | undefined;
+
 	constructor(
 		@INativeWorkbenchEnvironmentService environmentService: INativeWorkbenchEnvironmentService,
 		@IProductService productService: IProductService,
 		@ISharedProcessService sharedProcessService: ISharedProcessService,
 		@IStorageService storageService: IStorageService,
 		@IConfigurationService configurationService: IConfigurationService,
-		@IRequestService requestService: IRequestService
+		@IRequestService requestService: IRequestService,
+		@ILoggerService loggerService: ILoggerService,
 	) {
 		super();
 
 		if (supportsTelemetry(productService, environmentService)) {
 			const isInternal = isInternalTelemetry(productService, configurationService);
 			const channel = sharedProcessService.getChannel('telemetryAppender');
+			this._dataGuardLogger = this._register(loggerService.createLogger(
+				joinPath(environmentService.extHostLogsPath, 'telemetry-guard.log'),
+				{
+					id: 'telemetryDataGuard',
+					name: 'Telemetry Data Guard',
+					logLevel: 'always',
+					hidden: true,
+				}
+			));
 			const config: ITelemetryServiceConfig = {
 				appenders: [new TelemetryAppenderClient(channel)],
 				commonProperties: resolveWorkbenchCommonProperties(
@@ -64,6 +79,9 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 				piiPaths: getPiiPathsFromEnvironment(environmentService),
 				sendErrorTelemetry: true,
 				waitForExperimentProperties: experimentsEnabled(configurationService, productService, environmentService),
+				onDataGuardViolation: (violation) => {
+					this._dataGuardLogger?.info(formatTelemetryGuardViolation(violation));
+				},
 			};
 
 			this.impl = this._register(new BaseTelemetryService(config, configurationService, productService));
@@ -103,6 +121,10 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 
 	setCommonProperty(name: string, value: string | boolean): void {
 		this.impl.setCommonProperty(name, value);
+	}
+
+	setDataGuardMarkers(markers: readonly string[]): void {
+		this.impl.setDataGuardMarkers?.(markers);
 	}
 
 	get telemetryLevel(): TelemetryLevel {

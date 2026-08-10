@@ -18,12 +18,22 @@ import { Registry } from '../../registry/common/platform.js';
 import { ClassifiedEvent, IGDPRProperty, OmitMetadata, StrictPropertyCheck } from './gdprTypings.js';
 import { ITelemetryData, ITelemetryService, TelemetryConfiguration, TelemetryLevel, TELEMETRY_CRASH_REPORTER_SETTING_ID, TELEMETRY_OLD_SETTING_ID, TELEMETRY_SECTION_ID, TELEMETRY_SETTING_ID, ICommonProperties } from './telemetry.js';
 import { cleanData, getTelemetryLevel, ITelemetryAppender, TelemetryTrustedValue } from './telemetryUtils.js';
+import { detectTelemetryUserData, TelemetryGuardViolation } from './telemetryDataGuard.js';
 
 export interface ITelemetryServiceConfig {
 	appenders: ITelemetryAppender[];
 	sendErrorTelemetry?: boolean;
 	commonProperties?: ICommonProperties;
 	piiPaths?: string[];
+	/**
+	 * Extra canary / workspace markers for the fail-closed data guard.
+	 */
+	dataGuardMarkers?: string[];
+	/**
+	 * Called when the data guard blocks (or observes) a violating event.
+	 * Used to append a durable line under extHostLogsPath/telemetry-guard.log.
+	 */
+	onDataGuardViolation?: (violation: TelemetryGuardViolation) => void;
 	/**
 	 * If true, telemetry events will be buffered until setExperimentProperty is called
 	 * (up to 10 seconds) to ensure experiment context is attached to all events.
@@ -62,6 +72,8 @@ export class TelemetryService implements ITelemetryService {
 	private _commonProperties: ICommonProperties;
 	private _experimentProperties: { [name: string]: string | TelemetryTrustedValue<string> } = {};
 	private _piiPaths: string[];
+	private _dataGuardMarkers: string[];
+	private readonly _onDataGuardViolation: ((violation: TelemetryGuardViolation) => void) | undefined;
 	private _telemetryLevel: TelemetryLevel;
 	private _sendErrorTelemetry: boolean;
 
@@ -90,6 +102,8 @@ export class TelemetryService implements ITelemetryService {
 		this.msftInternal = this._commonProperties['common.msftInternal'] as boolean | undefined;
 
 		this._piiPaths = config.piiPaths || [];
+		this._dataGuardMarkers = [...(config.piiPaths || []), ...(config.dataGuardMarkers || [])];
+		this._onDataGuardViolation = config.onDataGuardViolation;
 		this._telemetryLevel = TelemetryLevel.USAGE;
 		this._sendErrorTelemetry = !!config.sendErrorTelemetry;
 		this._meteredConnectionService = config.meteredConnectionService;
@@ -137,6 +151,14 @@ export class TelemetryService implements ITelemetryService {
 
 	setCommonProperty(name: string, value: string | boolean): void {
 		this._commonProperties[name] = value;
+	}
+
+	/**
+	 * Replace session markers used by the fail-closed telemetry data guard
+	 * (workspace folder fsPaths, canary tokens, etc.).
+	 */
+	setDataGuardMarkers(markers: readonly string[]): void {
+		this._dataGuardMarkers = [...this._piiPaths, ...markers];
 	}
 
 	private _flushPendingEvents(): void {
@@ -211,6 +233,30 @@ export class TelemetryService implements ITelemetryService {
 	private _doLog(eventName: string, eventLevel: TelemetryLevel, data?: ITelemetryData) {
 		// add experiment properties
 		data = mixin(data, this._experimentProperties);
+
+		// Fail-closed data guard BEFORE cleanData / appenders. Extension-originated
+		// events (pluginHostTelemetry) are blocked on hit; core events are observed
+		// (logged) but still forwarded until the guard is tuned for first-party stacks.
+		const pluginHostTelemetry = !!(data && (data as ITelemetryData)['pluginHostTelemetry']);
+		const guard = detectTelemetryUserData(data, this._dataGuardMarkers);
+		if (guard.hit) {
+			const violation: TelemetryGuardViolation = {
+				timestamp: new Date().toISOString(),
+				eventName,
+				layer: guard.layer,
+				detail: guard.detail,
+				pluginHostTelemetry,
+				pipe: 'core',
+			};
+			try {
+				this._onDataGuardViolation?.(violation);
+			} catch {
+				// Logging must never throw into the telemetry path.
+			}
+			if (pluginHostTelemetry) {
+				return;
+			}
+		}
 
 		// remove all PII from data
 		data = cleanData(data, this._cleanupPatterns);

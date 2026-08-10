@@ -41,6 +41,7 @@ export class NullTelemetryServiceShape implements ITelemetryService {
 	publicLogError2() { }
 	setExperimentProperty() { }
 	setCommonProperty() { }
+	setDataGuardMarkers() { }
 }
 
 export const NullTelemetryService = new NullTelemetryServiceShape();

@@ -57,6 +57,12 @@ export interface ITelemetryService {
 	 * Common properties are added after PII cleaning and cannot be overridden by event data.
 	 */
 	setCommonProperty(name: string, value: string | boolean): void;
+
+	/**
+	 * Session markers (workspace folder paths, canary tokens) for the fail-closed data guard.
+	 * Optional on null/test telemetry shims.
+	 */
+	setDataGuardMarkers?(markers: readonly string[]): void;
 }
 
 export function telemetryLevelEnabled(service: ITelemetryService, level: TelemetryLevel): boolean {

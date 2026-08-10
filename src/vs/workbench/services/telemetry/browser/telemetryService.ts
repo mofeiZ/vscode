@@ -139,6 +139,10 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 		this.impl.setCommonProperty(name, value);
 	}
 
+	setDataGuardMarkers(markers: readonly string[]): void {
+		this.impl.setDataGuardMarkers?.(markers);
+	}
+
 	get telemetryLevel(): TelemetryLevel {
 		return this.impl.telemetryLevel;
 	}

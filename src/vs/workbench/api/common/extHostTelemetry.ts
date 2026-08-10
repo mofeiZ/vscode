@@ -8,6 +8,7 @@ import { createDecorator } from '../../../platform/instantiation/common/instanti
 import { Event, Emitter } from '../../../base/common/event.js';
 import { ExtHostTelemetryShape } from './extHost.protocol.js';
 import { ICommonProperties, TelemetryLevel } from '../../../platform/telemetry/common/telemetry.js';
+import { detectTelemetryUserData, formatTelemetryGuardViolation } from '../../../platform/telemetry/common/telemetryDataGuard.js';
 import { ILogger, ILoggerService } from '../../../platform/log/common/log.js';
 import { IExtHostInitDataService } from './extHostInitDataService.js';
 import { ExtensionIdentifier, IExtensionDescription } from '../../../platform/extensions/common/extensions.js';
@@ -15,7 +16,9 @@ import { UIKind } from '../../services/extensions/common/extensionHostProtocol.j
 import { cleanData, cleanRemoteAuthority, TelemetryLogGroup } from '../../../platform/telemetry/common/telemetryUtils.js';
 import { mixin } from '../../../base/common/objects.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
+import { joinPath } from '../../../base/common/resources.js';
 import { localize } from '../../../nls.js';
+import { IExtHostWorkspace } from './extHostWorkspace.js';
 
 type ExtHostTelemetryEventData = Record<string, any> & {
 	properties?: Record<string, any>;
@@ -37,12 +40,14 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 	private _oldTelemetryEnablement: boolean | undefined;
 	private readonly _inLoggingOnlyMode: boolean = false;
 	private readonly _outputLogger: ILogger;
+	private readonly _dataGuardLogger: ILogger;
 	private readonly _telemetryLoggers = new Map<string, ExtHostTelemetryLogger[]>();
 
 	constructor(
 		isWorker: boolean,
 		@IExtHostInitDataService private readonly initData: IExtHostInitDataService,
 		@ILoggerService loggerService: ILoggerService,
+		@IExtHostWorkspace private readonly extHostWorkspace: IExtHostWorkspace,
 	) {
 		super();
 		this._inLoggingOnlyMode = this.initData.environment.isExtensionTelemetryLoggingOnly;
@@ -53,6 +58,20 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 				hidden: true,
 				group: TelemetryLogGroup,
 			}));
+		this._dataGuardLogger = this._register(loggerService.createLogger(
+			joinPath(this.initData.logsLocation, 'telemetry-guard.log'),
+			{
+				id: 'telemetryDataGuardExtHost',
+				name: localize('telemetryDataGuard', "Telemetry Data Guard"),
+				logLevel: 'always',
+				hidden: true,
+			}
+		));
+	}
+
+	private _dataGuardMarkers(): string[] {
+		const folders = this.extHostWorkspace.getWorkspaceFolders() ?? [];
+		return folders.map(f => f.uri.fsPath);
 	}
 
 	getTelemetryConfiguration(): boolean {
@@ -76,7 +95,9 @@ export class ExtHostTelemetry extends Disposable implements ExtHostTelemetryShap
 			this._outputLogger,
 			this._inLoggingOnlyMode,
 			this.getBuiltInCommonProperties(extension),
-			{ isUsageEnabled: telemetryDetails.isUsageEnabled, isErrorsEnabled: telemetryDetails.isErrorsEnabled }
+			{ isUsageEnabled: telemetryDetails.isUsageEnabled, isErrorsEnabled: telemetryDetails.isErrorsEnabled },
+			this._dataGuardLogger,
+			() => this._dataGuardMarkers(),
 		);
 		const loggers = this._telemetryLoggers.get(extension.identifier.value) ?? [];
 		this._telemetryLoggers.set(extension.identifier.value, [...loggers, logger]);
@@ -203,13 +224,43 @@ export class ExtHostTelemetryLogger {
 		private readonly _logger: ILogger,
 		private readonly _inLoggingOnlyMode: boolean,
 		private readonly _commonProperties: Record<string, any>,
-		telemetryEnablements: { isUsageEnabled: boolean; isErrorsEnabled: boolean }
+		telemetryEnablements: { isUsageEnabled: boolean; isErrorsEnabled: boolean },
+		private readonly _dataGuardLogger: ILogger,
+		private readonly _getDataGuardMarkers: () => readonly string[],
 	) {
 		this.ignoreUnhandledExtHostErrors = options?.ignoreUnhandledErrors ?? false;
 		this._ignoreBuiltinCommonProperties = options?.ignoreBuiltInCommonProperties ?? false;
 		this._additionalCommonProperties = options?.additionalCommonProperties;
 		this._sender = sender;
 		this._telemetryEnablements = { isUsageEnabled: telemetryEnablements.isUsageEnabled, isErrorsEnabled: telemetryEnablements.isErrorsEnabled };
+	}
+
+	/**
+	 * Fail-closed Path B guard. Runs before enablement checks / cleanData / sender
+	 * so OSS (telemetry often NONE) still records and blocks exfil attempts.
+	 */
+	private _blockIfUserData(eventName: string, data: Record<string, any> | undefined): boolean {
+		const guard = detectTelemetryUserData(data ?? {}, this._getDataGuardMarkers());
+		if (!guard.hit) {
+			return false;
+		}
+		const prefixed = this._extension.publisher === 'vscode'
+			? `${this._extension.name}/${eventName}`
+			: `${this._extension.identifier.value}/${eventName}`;
+		try {
+			this._dataGuardLogger.info(formatTelemetryGuardViolation({
+				timestamp: new Date().toISOString(),
+				eventName: prefixed,
+				layer: guard.layer,
+				detail: guard.detail,
+				pluginHostTelemetry: false,
+				extensionId: this._extension.identifier.value,
+				pipe: 'extHost',
+			}));
+		} catch {
+			// never throw into extension telemetry API
+		}
+		return true;
 	}
 
 	updateTelemetryEnablements(isUsageEnabled: boolean, isErrorsEnabled: boolean): void {
@@ -263,6 +314,9 @@ export class ExtHostTelemetryLogger {
 	}
 
 	logUsage(eventName: string, data?: Record<string, any>): void {
+		if (this._blockIfUserData(eventName, data)) {
+			return;
+		}
 		if (!this._telemetryEnablements.isUsageEnabled) {
 			return;
 		}
@@ -270,6 +324,9 @@ export class ExtHostTelemetryLogger {
 	}
 
 	logError(eventNameOrException: Error | string, data?: Record<string, any>): void {
+		if (typeof eventNameOrException === 'string' && this._blockIfUserData(eventNameOrException, data)) {
+			return;
+		}
 		if (!this._telemetryEnablements.isErrorsEnabled || !this._sender) {
 			return;
 		}

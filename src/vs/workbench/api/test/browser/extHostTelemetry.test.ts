@@ -12,6 +12,7 @@ import { TelemetryLevel } from '../../../../platform/telemetry/common/telemetry.
 import { TestTelemetryLoggerService } from '../../../../platform/telemetry/test/common/telemetryLogAppender.test.js';
 import { IExtHostInitDataService } from '../../common/extHostInitDataService.js';
 import { ExtHostTelemetry, ExtHostTelemetryLogger } from '../../common/extHostTelemetry.js';
+import { IExtHostWorkspace } from '../../common/extHostWorkspace.js';
 import { IEnvironment } from '../../../services/extensions/common/extensionHostProtocol.js';
 import { mock } from '../../../test/common/workbenchTestServices.js';
 import type { TelemetryLoggerOptions, TelemetrySender } from 'vscode';
@@ -68,12 +69,19 @@ suite('ExtHostTelemetry', function () {
 		preRelease: false,
 	};
 
+	const mockWorkspace = new class extends mock<IExtHostWorkspace>() {
+		override getWorkspaceFolders() {
+			return undefined;
+		}
+	};
+
 	const createExtHostTelemetry = () => {
 		const extensionTelemetry = new ExtHostTelemetry(false, new class extends mock<IExtHostInitDataService>() {
 			override environment: IEnvironment = mockEnvironment;
 			override telemetryInfo = mockTelemetryInfo;
 			override remote = mockRemote;
-		}, new TestTelemetryLoggerService(DEFAULT_LOG_LEVEL));
+			override logsLocation = URI.parse('file:///tmp/exthost-logs');
+		}, new TestTelemetryLoggerService(DEFAULT_LOG_LEVEL), mockWorkspace);
 		store.add(extensionTelemetry);
 		extensionTelemetry.$initializeTelemetryLevel(TelemetryLevel.USAGE, true, { usage: true, error: true });
 		return extensionTelemetry;
@@ -252,27 +260,20 @@ suite('ExtHostTelemetry', function () {
 	});
 
 
-	test('Ensure logger properly cleans PII', function () {
+	test('Ensure logger blocks PII instead of forwarding scrubbed events', function () {
 		const functionSpy: TelemetryLoggerSpy = { dataArr: [], exceptionArr: [], flushCalled: false };
 
 		const logger = createLogger(functionSpy);
 
-		// Log an event with a bunch of PII, this should all get cleaned out
+		// Fail-closed data guard: user-data shapes never reach the sender.
 		logger.logUsage('test-event', {
 			'fake-password': 'pwd=123',
-			'fake-email': 'no-reply@example.com',
 			'fake-token': 'token=123',
 			'fake-slack-token': 'xoxp-123',
 			'fake-path': '/Users/username/.vscode/extensions',
 		});
 
-		assert.strictEqual(functionSpy.dataArr.length, 1);
-		assert.strictEqual(functionSpy.dataArr[0].eventName, `${mockExtensionIdentifier.name}/test-event`);
-		assert.strictEqual(functionSpy.dataArr[0].data['fake-password'], '<REDACTED: Generic Secret>');
-		assert.strictEqual(functionSpy.dataArr[0].data['fake-email'], '<REDACTED: Email>');
-		assert.strictEqual(functionSpy.dataArr[0].data['fake-token'], '<REDACTED: Generic Secret>');
-		assert.strictEqual(functionSpy.dataArr[0].data['fake-slack-token'], '<REDACTED: Slack Token>');
-		assert.strictEqual(functionSpy.dataArr[0].data['fake-path'], '<REDACTED: user-file-path>');
+		assert.strictEqual(functionSpy.dataArr.length, 0);
 	});
 
 	test('Ensure output channel is logged to', function () {
@@ -283,7 +284,8 @@ suite('ExtHostTelemetry', function () {
 			override environment: IEnvironment = mockEnvironment;
 			override telemetryInfo = mockTelemetryInfo;
 			override remote = mockRemote;
-		}, loggerService);
+			override logsLocation = URI.parse('file:///tmp/exthost-logs');
+		}, loggerService, mockWorkspace);
 		extensionTelemetry.$initializeTelemetryLevel(TelemetryLevel.USAGE, true, { usage: true, error: true });
 
 		const functionSpy: TelemetryLoggerSpy = { dataArr: [], exceptionArr: [], flushCalled: false };
