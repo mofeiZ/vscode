@@ -66,6 +66,14 @@ export interface ExtensionHostCrashRecord {
 	readonly secondsSinceLastAlert: number | null;
 	readonly activatedExtensionCount: number;
 	readonly extensionIds: string[];
+	/**
+	 * True when V8 wrote a near-heap-limit `.heapsnapshot` under the host's
+	 * diagnostic dir this lifetime. Numbers/booleans only — the raw snapshot
+	 * stays local and is never telemetered.
+	 */
+	readonly heapSnapshotCaptured: boolean;
+	/** RSS-style bucket edge (MB) of the captured snapshot file size, or null. */
+	readonly heapSnapshotSizeBucketMb: number | null;
 	/** Set after a same-session `exthostCrashRecord` emission succeeds. */
 	sentInSession?: boolean;
 }
@@ -85,6 +93,9 @@ export interface ExtensionHostExitContext {
 	readonly exitClass: ExtensionHostExitClass;
 	readonly oomSuspected: boolean;
 	readonly oomHeuristic: boolean;
+	/** Optional: stamped when the crash path already scanned the diagnostic dir. */
+	readonly heapSnapshotCaptured?: boolean;
+	readonly heapSnapshotSizeBucketMb?: number | null;
 }
 
 /** Minimal file surface so flush/write can be unit-tested with InMemoryFileSystemProvider. */
@@ -146,6 +157,8 @@ export function buildExtensionHostCrashRecord(args: {
 	readonly secondsSinceLastSample: number | null;
 	readonly secondsSinceLastAlert: number | null;
 	readonly extensionIds: readonly string[];
+	readonly heapSnapshotCaptured?: boolean;
+	readonly heapSnapshotSizeBucketMb?: number | null;
 }): ExtensionHostCrashRecord {
 	return {
 		schema: EXTENSION_HOST_CRASH_RECORD_SCHEMA,
@@ -165,6 +178,8 @@ export function buildExtensionHostCrashRecord(args: {
 		secondsSinceLastAlert: args.secondsSinceLastAlert,
 		activatedExtensionCount: args.extensionIds.length,
 		extensionIds: args.extensionIds.slice(),
+		heapSnapshotCaptured: args.heapSnapshotCaptured === true,
+		heapSnapshotSizeBucketMb: typeof args.heapSnapshotSizeBucketMb === 'number' ? args.heapSnapshotSizeBucketMb : null,
 	};
 }
 
@@ -188,6 +203,8 @@ export function crashRecordTelemetryData(record: ExtensionHostCrashRecord, extra
 		secondsSinceLastAlert: record.secondsSinceLastAlert,
 		activatedExtensionCount: record.activatedExtensionCount,
 		extensionIds: record.extensionIds.slice(),
+		heapSnapshotCaptured: record.heapSnapshotCaptured === true,
+		heapSnapshotSizeBucketMb: record.heapSnapshotSizeBucketMb ?? null,
 	};
 	if (typeof extra?.flushDelaySec === 'number') {
 		data.flushDelaySec = extra.flushDelaySec;

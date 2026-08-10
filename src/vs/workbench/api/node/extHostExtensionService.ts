@@ -24,9 +24,10 @@ import { assertType } from '../../../base/common/types.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import { BidirectionalMap } from '../../../base/common/map.js';
 import { DisposableStore, toDisposable } from '../../../base/common/lifecycle.js';
-import { IntervalTimer } from '../../../base/common/async.js';
+import { IntervalTimer, timeout } from '../../../base/common/async.js';
 import { joinPath } from '../../../base/common/resources.js';
 import { ILogger, ILoggerService } from '../../../platform/log/common/log.js';
+import { isInternalDiagnosticsEnabled } from '../../services/extensions/common/diagnosticIsolation.js';
 import {
 	buildMemoryAlertTelemetryPayload,
 	buildMemorySample,
@@ -39,6 +40,19 @@ import {
 	MemorySampleRing,
 	shouldEmitMemorySampleTelemetry,
 } from '../../services/extensions/common/extensionHostMemoryMonitor.js';
+import {
+	extensionLocationsFromDescriptions,
+	HEAP_DIAGNOSIS_EH_COMMAND_ID,
+	HeapDiagnosisCoordinator,
+} from '../../services/extensions/common/extensionHostHeapWiring.js';
+import {
+	decodeSnapshotFile,
+	extractClassGroups,
+	startAllocationSampling,
+	stopAndGetProfile,
+	writeSnapshot,
+} from '../../services/extensions/node/extensionHostHeapCapture.js';
+import { IExtHostCommands } from '../common/extHostCommands.js';
 const require = nodeModule.createRequire(import.meta.url);
 
 class NodeModuleRequireInterceptor extends RequireInterceptor {
@@ -166,6 +180,7 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 	private _memoryAlertState: MemoryAlertState = createMemoryAlertState();
 	private readonly _memorySampleRing = new MemorySampleRing();
 	private _memoryLogger: ILogger | undefined;
+	private _heapDiagnosis: HeapDiagnosisCoordinator | undefined;
 
 	protected async _beforeAlmostReadyToRunExtensions(): Promise<void> {
 		// make sure console.log calls make it to the render
@@ -202,6 +217,57 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 
 		// Per-EH memory sampler (numbers/buckets only → guarded Path A + local metrics).
 		this._startExtensionHostMemoryMonitor();
+		this._startHeapDiagnosisWiring();
+	}
+
+	private _startHeapDiagnosisWiring(): void {
+		const artifactDirFsPath = this._initData.logsLocation.fsPath;
+		this._heapDiagnosis = new HeapDiagnosisCoordinator({
+			writeSnapshot,
+			startSampling: startAllocationSampling,
+			stopAndGetProfile,
+			extractClassGroupsFromSnapshot: async (path) => extractClassGroups(await decodeSnapshotFile(path)),
+			delay: (ms) => timeout(ms),
+			nowMs: () => Date.now(),
+			listExtensionLocations: () => extensionLocationsFromDescriptions(this._myRegistry.getAllExtensionDescriptions()),
+			artifactDirFsPath,
+			pid: this._hostUtils.pid ?? process.pid,
+			affinity: 0, // stamped main-thread-side on telemetry emit
+			emitSafeSummary: (summary) => {
+				type ExtHostHeapAttributionClassification = {
+					owner: 'anyarchive';
+					comment: 'Guard-safe heap attribution summary after alert/on-demand capture. Opaque ids + buckets only.';
+					schema: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Summary schema version' };
+					affinity: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Host affinity (main-stamped)' };
+					pid: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Opaque process id' };
+					snapshotSeq: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Capture pair sequence' };
+					extensions: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; comment: 'Top opaque extension attribution rows' };
+					grownClassGroups: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; comment: 'Top opaque grown class-group rows' };
+					topDominatorRetainedBucketMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Top dominator retained bucket MB' };
+					dominatorDepth: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Dominator depth shape' };
+					dominatorFanout: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Dominator fanout shape' };
+					retainedTopSharePct: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Top dominator share of growth' };
+					retainerPathLen: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Retainer path length shape' };
+				};
+				this._mainThreadTelemetryProxy.$publicLog2<typeof summary, ExtHostHeapAttributionClassification>(
+					'exthostHeapAttribution',
+					summary,
+				);
+			},
+			logLocalReport: (text) => {
+				this._memoryLogger?.info(text);
+				this._logService.info(`[exthostHeapDiagnosis]\n${text}`);
+			},
+			isGateEnabled: () => isInternalDiagnosticsEnabled(),
+		});
+
+		const commands = this._instaService.invokeFunction(accessor => accessor.get(IExtHostCommands));
+		this._store.add(commands.registerCommand(true, HEAP_DIAGNOSIS_EH_COMMAND_ID, async () => {
+			if (!this._heapDiagnosis) {
+				return { ok: false, reason: 'capture-failed', detail: 'not-initialized' };
+			}
+			return this._heapDiagnosis.captureAndDiagnoseCommand();
+		}));
 	}
 
 	private _startExtensionHostMemoryMonitor(): void {
@@ -310,6 +376,13 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			'exthostMemoryAlert',
 			buildMemoryAlertTelemetryPayload(sample, decision.trigger, decision.thresholdBucketMb ?? 3072),
 		);
+
+		// DETECT → ATTRIBUTE/DIAGNOSE: rate-limited heap snapshot pair + safe summary.
+		// Automatic capture is Tier-1 (internal-diagnostics gate); sampler alert itself stays Tier-0.
+		const heap = this._heapDiagnosis?.onMemoryAlert();
+		if (heap && !heap.started) {
+			this._logService.trace(`[exthostHeapDiagnosis] alert capture skipped: ${heap.reason}`);
+		}
 	}
 
 	protected _getEntryPoint(extensionDescription: IExtensionDescription): string | undefined {

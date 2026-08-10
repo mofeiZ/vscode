@@ -57,6 +57,7 @@ import { IExtensionIgnoredRecommendationsService, IExtensionRecommendationsServi
 import { IWorkspaceExtensionsConfigService } from '../../../services/extensionRecommendations/common/workspaceExtensionsConfig.js';
 import product from '../../../../platform/product/common/product.js';
 import { addDiagnosticIsolation, getDiagnosticIsolationIds, isInternalDiagnosticsEnabled, removeDiagnosticIsolation } from '../../../services/extensions/common/diagnosticIsolation.js';
+import { HEAP_DIAGNOSIS_COMMAND_ID, HEAP_DIAGNOSIS_EH_COMMAND_ID, refuseHeapDiagnosisCommandIfGatedOff } from '../../../services/extensions/common/extensionHostHeapWiring.js';
 import { EXTENSIONS_SUPPORT_AGENTS_WINDOW } from '../../../services/extensions/common/extensionManifestPropertiesService.js';
 import { IHostService } from '../../../services/host/browser/host.js';
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
@@ -440,6 +441,26 @@ if (isInternalDiagnosticsEnabled({ productEnabled: product.internalDiagnosticsEn
 		handler: (): readonly string[] => getDiagnosticIsolationIds()
 	});
 }
+
+/**
+ * On-demand heap capture + diagnose (u41). Always registered so the gate-off
+ * refuse path is callable; EH does the real capture when the gate is ON.
+ * Raw snapshots stay local; only the safe summary is telemetered from the EH.
+ */
+CommandsRegistry.registerCommand({
+	id: HEAP_DIAGNOSIS_COMMAND_ID,
+	handler: async (accessor: ServicesAccessor) => {
+		const refused = refuseHeapDiagnosisCommandIfGatedOff(
+			isInternalDiagnosticsEnabled({ productEnabled: product.internalDiagnosticsEnabled === true }),
+		);
+		if (refused) {
+			return refused;
+		}
+		// Delegate to the EH-registered implementation (capture runs in-process there).
+		const commandService = accessor.get(ICommandService);
+		return commandService.executeCommand(HEAP_DIAGNOSIS_EH_COMMAND_ID);
+	}
+});
 
 CommandsRegistry.registerCommand('extension.open', async (accessor: ServicesAccessor, extensionId: string, tab?: ExtensionEditorTab, preserveFocus?: boolean, feature?: string, sideByside?: boolean) => {
 	const extensionService = accessor.get(IExtensionsWorkbenchService);

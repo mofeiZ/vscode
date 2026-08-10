@@ -36,12 +36,14 @@ import { INativeWorkbenchEnvironmentService } from '../../environment/electron-b
 import { IShellEnvironmentService } from '../../environment/electron-browser/shellEnvironmentService.js';
 import { MessagePortExtHostConnection, writeExtHostConnection } from '../common/extensionHostEnv.js';
 import { createMessageOfType, IExtensionHostInitData, MessageType, NativeLogMarkers, UIKind, isMessageOfType } from '../common/extensionHostProtocol.js';
+import { isInternalDiagnosticsEnabled } from '../common/diagnosticIsolation.js';
 import {
 	classifyExtensionHostExit,
 	formatUnexpectedExitBreadcrumb,
 	publishExtensionHostExitContext,
 	stderrLooksLikeOom,
 } from '../common/extensionHostCrashRecord.js';
+import { withNearHeapLimitExecArgv } from '../common/extensionHostHeapWiring.js';
 import { LocalProcessRunningLocation, localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../common/extensionRunningLocation.js';
 import { ExtensionHostExtensions, ExtensionHostStartup, IExtensionHost, IExtensionInspectInfo, resolveEnabledApiProposalsFallbackExperiment } from '../common/extensions.js';
 import { IHostService } from '../../host/browser/host.js';
@@ -303,15 +305,6 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 		// unconditionally.
 		opts.execArgv.unshift('--dns-result-order=ipv4first', '--experimental-network-inspection');
 
-		// Catch all output coming from the extension host process
-		type Output = { data: string; format: string[] };
-		const onStdout = this._register(this._handleProcessOutputStream(this._extensionHostProcess.onStdout));
-		const onStderr = this._register(this._handleProcessOutputStream(this._extensionHostProcess.onStderr));
-		const onOutput = Event.any(
-			Event.map(onStdout.event, o => ({ data: `%c${o}`, format: [''] })),
-			Event.map(onStderr.event, o => ({ data: `%c${o}`, format: ['color: red'] }))
-		);
-
 		// Persist extension host process output (stdout/stderr) to a durable file
 		// under this host's affinity-suffixed exthost log directory. Native EH
 		// crashes never reach the JS layer; capturing output from the (surviving)
@@ -320,6 +313,23 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 		// exfil channel. Affinity > 0 must not share the affinity-0 logger path/id.
 		const affinity = this.runningLocation.affinity;
 		const hostLogsPath = localProcessExtensionHostLogsPath(this._environmentService.extHostLogsPath, affinity);
+
+		// Tier-1: V8 auto-writes a near-heap-limit snapshot into the per-host log
+		// root (raw artifact stays local; crash record gets numbers-only flags).
+		opts.execArgv = withNearHeapLimitExecArgv(
+			opts.execArgv,
+			hostLogsPath.fsPath,
+			isInternalDiagnosticsEnabled({ productEnabled: this._productService.internalDiagnosticsEnabled === true }),
+		);
+
+		// Catch all output coming from the extension host process
+		type Output = { data: string; format: string[] };
+		const onStdout = this._register(this._handleProcessOutputStream(this._extensionHostProcess.onStdout));
+		const onStderr = this._register(this._handleProcessOutputStream(this._extensionHostProcess.onStderr));
+		const onOutput = Event.any(
+			Event.map(onStdout.event, o => ({ data: `%c${o}`, format: [''] })),
+			Event.map(onStderr.event, o => ({ data: `%c${o}`, format: ['color: red'] }))
+		);
 		const ehProcessLog = this._register(this._loggerService.createLogger(
 			joinPath(hostLogsPath, 'exthost-stderr.log'),
 			{
