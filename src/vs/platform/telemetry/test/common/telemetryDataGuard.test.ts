@@ -341,4 +341,203 @@ suite('TelemetryDataGuard', () => {
 		}, { markers: ['/Users/alice/proj'] });
 		assert.strictEqual(result.hit, false);
 	});
+
+	// --- sr2 round-2 follow-ups (u28) ---
+
+	test('sr2 FP2: api/scm/createSourceControl event name is NOT path-blocked', () => {
+		const result = detectTelemetryUserData(
+			{ extensionId: 'vscode.git' },
+			{
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+				eventName: 'api/scm/createSourceControl',
+			},
+		);
+		assert.strictEqual(result.hit, false);
+		assert.strictEqual(
+			redactTelemetryGuardEventName('api/scm/createSourceControl'),
+			'api/scm/createSourceControl',
+		);
+	});
+
+	test('sr2 FP2: marketplace / github URLs are NOT path-blocked', () => {
+		for (const url of [
+			'https://marketplace.visualstudio.com/_apis/public/gallery',
+			'https://github.com/microsoft/vscode',
+		]) {
+			const result = detectTelemetryUserData({ url }, { markers: [] });
+			assert.strictEqual(result.hit, false, `URL falsely blocked: ${url}`);
+		}
+		const rel = detectTelemetryUserData(
+			{ resource: 'src/vs/editor/editor.main.ts' },
+			{ markers: [] },
+		);
+		assert.strictEqual(rel.hit, false, 'relative editor path must not path-hit');
+	});
+
+	test('sr2 FP1: key/sourceKey/reconnectionToken shapes are NOT secret-blocked', () => {
+		const shapes = [
+			{ key: 'abc', other: 'def' },
+			{ 'key-binding': 'ctrl+a' },
+			{ 'token.type': 'id', n: 1 },
+			{ apiKey: 'id', x: 'y' },
+			{ sourceKey: 'editor.fontSize', reconnectionToken: 'opaque-token-value' },
+		];
+		for (const payload of shapes) {
+			const ehA = detectTelemetryUserData(payload, {
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+				eventName: 'settingsEditor.settingModified',
+			});
+			const core = detectTelemetryUserData(payload, { eventName: 'settingsEditor.settingModified' });
+			const pathB = detectTelemetryUserData(payload, {
+				strictShape: true,
+				eventName: 'settingsEditor.settingModified',
+			});
+			assert.strictEqual(ehA.hit, false, `ehA FP on ${JSON.stringify(payload)}`);
+			assert.strictEqual(core.hit, false, `core FP on ${JSON.stringify(payload)}`);
+			// Path B may shape-reject free-form values; secret layer must not be the reason.
+			if (pathB.hit) {
+				assert.notStrictEqual(pathB.layer, 'secret', `Path B secret FP on ${JSON.stringify(payload)}`);
+			}
+		}
+		// Assignment-context secret still fires.
+		const realSecret = detectTelemetryUserData({ note: 'api_key=supersecretvalue' });
+		assert.strictEqual(realSecret.hit, true);
+		if (realSecret.hit) {
+			assert.strictEqual(realSecret.layer, 'secret');
+		}
+	});
+
+	test('sr2 FP5: scrub preserves JS stack / node:internal / dylib frames', () => {
+		const lines = [
+			'at Object.activate (out/vs/workbench/api/node/extHostExtensionService.js:112:9)',
+			'[uv_os_homedir] failed; node:internal/modules/cjs/loader:1247 throw err',
+			'libnode.dylib 0x000000010a2b3c4d node::Abort() [/opt/homebrew/lib/libnode.dylib]',
+		];
+		for (const line of lines) {
+			const scrubbed = scrubPersistedExtensionHostLogLine(line);
+			assert.ok(!scrubbed.includes('<REDACTED: line:'), `stack nuked: ${scrubbed}`);
+		}
+		// /opt/homebrew/... is a rooted sensitive path — path token redacted, line not hashed away.
+		const optLine = 'libnode.dylib 0x1 node::Abort() [/opt/homebrew/lib/libnode.dylib]';
+		const optScrubbed = scrubPersistedExtensionHostLogLine(optLine);
+		assert.ok(!optScrubbed.includes('/opt/homebrew/lib/libnode.dylib'));
+		assert.ok(!optScrubbed.includes('<REDACTED: line:'));
+	});
+
+	test('sr2 B1: unpadded base64 / base64url / odd hex are BLOCKED', () => {
+		const path = '/Users/alice/proj/secret.ts';
+		const padded = globalThis.btoa(path);
+		const unpadded = padded.replace(/=+$/, '');
+		const base64url = unpadded.replace(/\+/g, '-').replace(/\//g, '_');
+		const hex = Array.from(path).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+		// Odd-length evade = strip a leading 0 nibble from a 0x00-prefixed encoding (sr2 B1).
+		const hexWithLeading0 = Array.from(`\0${path}`).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+		const oddHex = hexWithLeading0.slice(1);
+		for (const payload of [{ p: unpadded }, { p: base64url }, { p: oddHex }, { p: `h${hex}` }]) {
+			const pathA = detectTelemetryUserData(payload, {
+				markers: ['/Users/alice/proj'],
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+			});
+			const pathB = detectTelemetryUserData(payload, {
+				markers: ['/Users/alice/proj'],
+				strictShape: true,
+			});
+			assert.strictEqual(pathA.hit, true, `Path A miss for ${JSON.stringify(payload)}`);
+			assert.strictEqual(pathB.hit, true, `Path B miss for ${JSON.stringify(payload)}`);
+		}
+		// Structural length rule: >32 opaque token rejected unless UUID/version.
+		const longToken = detectTelemetryUserData(
+			{ token: 'a'.repeat(38) },
+			{ strictShape: true },
+		);
+		assert.strictEqual(longToken.hit, true);
+		assert.strictEqual(isAllowedExtensionTelemetryString('a'.repeat(38)), false);
+		assert.strictEqual(isAllowedExtensionTelemetryString('1.2.3-beta.1'), true);
+	});
+
+	test('sr2 B2: mixed char-code object/array still BLOCKED', () => {
+		const path = '/Users/a/b/c.ts'; // 14 units
+		const mixed: Record<string, unknown> = { pad: 'ok' };
+		for (let i = 0; i < path.length; i++) {
+			mixed[`c${i}`] = path.charCodeAt(i);
+		}
+		const codes = Array.from(path).map(c => c.charCodeAt(0));
+		const wrapped: Record<string, unknown> = {};
+		for (let i = 0; i < path.length; i++) {
+			wrapped[`c${i}`] = { v: path.charCodeAt(i) };
+		}
+		const cases: unknown[] = [
+			mixed,
+			[...codes, 'x'],
+			new Map(codes.map((n, i) => [i, n])),
+			wrapped,
+		];
+		for (const payload of cases) {
+			const pathA = detectTelemetryUserData(
+				{ measurements: payload, pluginHostTelemetry: true },
+				{ boundMeasurements: true, failClosedOnDepthAbort: true },
+			);
+			const pathB = detectTelemetryUserData({ measurements: payload }, { strictShape: true });
+			assert.strictEqual(pathA.hit, true, 'Path A miss for mixed shape');
+			assert.strictEqual(pathB.hit, true, 'Path B miss for mixed shape');
+		}
+	});
+
+	test('sr2 B3: boolean bit-channel is BLOCKED', () => {
+		const bits: Record<string, boolean> = {};
+		for (let i = 0; i < 240; i++) {
+			bits[`b${i}`] = i % 2 === 0;
+		}
+		const pathA = detectTelemetryUserData(bits, {
+			boundMeasurements: true,
+			failClosedOnDepthAbort: true,
+		});
+		const pathB = detectTelemetryUserData(bits, { strictShape: true });
+		assert.strictEqual(pathA.hit, true);
+		assert.strictEqual(pathB.hit, true);
+		if (pathA.hit) {
+			assert.strictEqual(pathA.layer, 'shape');
+		}
+	});
+
+	test('sr2 D1: DAG-shared subtree returns fast (WeakSet)', () => {
+		const leaf = { v: 1 };
+		let node: Record<string, unknown> = leaf;
+		for (let d = 0; d < 8; d++) {
+			const next: Record<string, unknown> = {};
+			for (let f = 0; f < 8; f++) {
+				next[`k${f}`] = node;
+			}
+			node = next;
+		}
+		const start = Date.now();
+		const result = detectTelemetryUserData(node, {
+			boundMeasurements: true,
+			failClosedOnDepthAbort: true,
+		});
+		const ms = Date.now() - start;
+		assert.ok(ms < 200, `DAG traversal too slow: ${ms}ms`);
+		assert.ok(typeof result.hit === 'boolean');
+	});
+
+	test('sr2 S1: scrub redacts space-containing path tails', () => {
+		const line = 'open failed /Users/alice/My Documents/tax-return-2025.pdf';
+		const scrubbed = scrubPersistedExtensionHostLogLine(line);
+		assert.ok(!scrubbed.includes('tax-return-2025.pdf'), `filename leaked: ${scrubbed}`);
+		assert.ok(!scrubbed.includes('/Users/alice'), `home path leaked: ${scrubbed}`);
+		assert.ok(scrubbed.includes('REDACTED'));
+	});
+
+	test('sr2 FP3: large non-code-unit timing arrays are not measurement-blocked', () => {
+		// Epoch-ms timings sit outside the code-unit smuggling budget.
+		const marks = Array.from({ length: 30 }, (_, i) => 1_700_000_000_000 + i * 17);
+		const result = detectTelemetryUserData(
+			{ marks, pluginHostTelemetry: true },
+			{ boundMeasurements: true, failClosedOnDepthAbort: true },
+		);
+		assert.strictEqual(result.hit, false);
+	});
 });

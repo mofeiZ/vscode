@@ -228,6 +228,61 @@ suite('TelemetryService', () => {
 		service.dispose();
 	});
 
+	test('sr2 G3: blocked pluginHost events do not consume common.sequence', function () {
+		let seq = 0;
+		const commonProperties = {
+			'common.sequence': {
+				get: () => ++seq,
+				enumerable: true,
+			},
+		};
+		const violations: unknown[] = [];
+		const testAppender = new TestTelemetryAppender();
+		const service = new TelemetryService({
+			appenders: [testAppender],
+			commonProperties: Object.create(null, {
+				'common.sequence': commonProperties['common.sequence'],
+			}),
+			dataGuardMarkers: ['/Users/alice/proj'],
+			onDataGuardViolation: v => { violations.push(v); },
+		}, new TestConfigurationService(), TestProductService);
+
+		service.publicLog('blocked.plugin', {
+			pluginHostTelemetry: true,
+			path: '/Users/alice/proj/secret.ts',
+		});
+		assert.strictEqual(testAppender.getEventsCount(), 0, 'pluginHost violation must be blocked');
+		assert.ok(violations.length >= 1, 'violation must be recorded');
+		assert.strictEqual(seq, 0, 'blocked event must not read common.sequence');
+
+		service.publicLog('ok.event', { count: 1 });
+		assert.strictEqual(testAppender.getEventsCount(), 1);
+		assert.strictEqual(seq, 1, 'forwarded event consumes exactly one sequence');
+		assert.strictEqual(testAppender.events[0].data['common.sequence'], 1);
+
+		service.dispose();
+	});
+
+	test('sr2 G3: publicLog without data does not mutate experiment properties', function () {
+		const testAppender = new TestTelemetryAppender();
+		const service = new TelemetryService({
+			appenders: [testAppender],
+			commonProperties: { 'common.platform': 'test' },
+		}, new TestConfigurationService(), TestProductService);
+
+		service.setExperimentProperty('exp.flag', 'on');
+		service.publicLog('noDataEvent');
+		service.publicLog('noDataEvent2');
+
+		// Experiment props must stay isolated; common props must not leak into them
+		// via mixin(undefined, _experimentProperties) aliasing.
+		assert.strictEqual(testAppender.events[0].data['exp.flag']?.value ?? testAppender.events[0].data['exp.flag'], 'on');
+		assert.strictEqual(testAppender.events[0].data['common.platform'], 'test');
+		assert.strictEqual(testAppender.events[1].data['common.platform'], 'test');
+
+		service.dispose();
+	});
+
 	test('telemetry on by default', function () {
 		const testAppender = new TestTelemetryAppender();
 		const service = new TelemetryService({ appenders: [testAppender] }, new TestConfigurationService(), TestProductService);

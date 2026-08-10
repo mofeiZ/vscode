@@ -231,20 +231,33 @@ export class TelemetryService implements ITelemetryService {
 	}
 
 	private _doLog(eventName: string, eventLevel: TelemetryLevel, data?: ITelemetryData) {
-		// Merge experiment + common properties BEFORE the guard so they are scanned
-		// (G3). Previously _commonProperties reached appenders raw/unscanned.
-		data = mixin(data, this._experimentProperties);
-		data = mixin(data, this._commonProperties);
+		// Spread into a fresh object so mixin never returns the shared
+		// _experimentProperties / _commonProperties source when data is undefined
+		// (mixin(nonObject, source) === source; sr2 correctness note).
+		data = mixin({ ...(data ?? {}) }, this._experimentProperties);
 
 		// Fail-closed data guard BEFORE cleanData / appenders. Extension-originated
 		// events (pluginHostTelemetry) use strict-shape allowlist and are blocked on
 		// hit; core events are observed (logged) but still forwarded until the guard
 		// is tuned for first-party stacks.
 		const pluginHostTelemetry = !!(data && (data as ITelemetryData)['pluginHostTelemetry']);
+
+		// Scan common properties (G3) but do NOT read common.sequence yet — that
+		// getter increments on access. Blocked pluginHost events must not consume
+		// a sequence number (sr2 correctness note; restore v1 gap-free behavior).
+		const commonForScan: ICommonProperties = Object.create(null);
+		for (const key of Object.keys(this._commonProperties)) {
+			if (key === 'common.sequence') {
+				continue;
+			}
+			commonForScan[key] = this._commonProperties[key];
+		}
+		const guardData = mixin({ ...(data ?? {}) }, commonForScan);
+
 		// Path A pluginHostTelemetry: normalize + bound measurements + fail-closed
 		// depth (collapses rt1 #1/#6/#7) without the Path B string allowlist, which
 		// would reject legitimate first-party EH free-form fields (activatePlugin).
-		const guard = detectTelemetryUserData(data, {
+		const guard = detectTelemetryUserData(guardData, {
 			markers: this._dataGuardMarkers,
 			boundMeasurements: pluginHostTelemetry,
 			failClosedOnDepthAbort: pluginHostTelemetry,
@@ -273,6 +286,9 @@ export class TelemetryService implements ITelemetryService {
 			// first-party stacks — extensions cannot strip pluginHostTelemetry on
 			// IPC, so Path B / pluginHost Path A remain the hard block surface.
 		}
+
+		// Merge common properties (including sequence) only for events we forward.
+		data = mixin(data, this._commonProperties);
 
 		// remove all PII from data (includes common properties after G3 reorder)
 		data = cleanData(data, this._cleanupPatterns);
