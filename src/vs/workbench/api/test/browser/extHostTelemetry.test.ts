@@ -186,10 +186,16 @@ suite('ExtHostTelemetry', function () {
 		logger.logError('test-event', { 'test-data': 'test-data' });
 		assert.strictEqual(functionSpy.dataArr.length, 3);
 
+		// Error objects carry absolute stack paths — strict-shape guard blocks (G1).
 		logger.logError(new Error('test-error'), { 'test-data': 'test-data' });
 		assert.strictEqual(functionSpy.dataArr.length, 3);
-		assert.strictEqual(functionSpy.exceptionArr.length, 1);
+		assert.strictEqual(functionSpy.exceptionArr.length, 0);
 
+		// Allowlisted exception envelope still reaches the sender.
+		const safeError = new Error('test-error');
+		safeError.stack = 'test-error';
+		logger.logError(safeError, { 'test-data': 'test-data' });
+		assert.strictEqual(functionSpy.exceptionArr.length, 1);
 
 		// Assert not flushed
 		assert.strictEqual(functionSpy.flushCalled, false);
@@ -217,7 +223,9 @@ suite('ExtHostTelemetry', function () {
 		logger.logError('test-event', { 'test-data': 'test-data' });
 		assert.strictEqual(functionSpy.dataArr.length, 3);
 
-		logger.logError(new Error('test-error'), { 'test-data': 'test-data' });
+		const safeError = new Error('test-error');
+		safeError.stack = 'test-error';
+		logger.logError(safeError, { 'test-data': 'test-data' });
 		assert.strictEqual(functionSpy.dataArr.length, 3);
 		assert.strictEqual(functionSpy.exceptionArr.length, 1);
 
@@ -235,7 +243,9 @@ suite('ExtHostTelemetry', function () {
 		const functionSpy: TelemetryLoggerSpy = { dataArr: [], exceptionArr: [], flushCalled: false };
 
 		const logger = createLogger(functionSpy, undefined, { additionalCommonProperties: { 'common.foo': 'bar' } });
-		logger.logError(new Error('Test error'));
+		const safeError = new Error('test-error');
+		safeError.stack = 'test-error';
+		logger.logError(safeError);
 		assert.strictEqual(functionSpy.exceptionArr.length, 1);
 		assert.strictEqual(functionSpy.exceptionArr[0].data['common.foo'], 'bar');
 		assert.strictEqual(functionSpy.exceptionArr[0].data['common.product'], 'test');
@@ -274,6 +284,26 @@ suite('ExtHostTelemetry', function () {
 		});
 
 		assert.strictEqual(functionSpy.dataArr.length, 0);
+	});
+
+	test('G1 logError(Error) with path in message is blocked', function () {
+		const functionSpy: TelemetryLoggerSpy = { dataArr: [], exceptionArr: [], flushCalled: false };
+		const logger = createLogger(functionSpy);
+		const err = new Error("ENOENT: open '/Users/alice/project/.env'");
+		err.stack = "Error: ENOENT: open '/Users/alice/project/.env'";
+		logger.logError(err, { folder: '/Users/alice/project' });
+		assert.strictEqual(functionSpy.exceptionArr.length, 0);
+		logger.dispose();
+	});
+
+	test('G2 additionalCommonProperties with path is blocked', function () {
+		const functionSpy: TelemetryLoggerSpy = { dataArr: [], exceptionArr: [], flushCalled: false };
+		const logger = createLogger(functionSpy, undefined, {
+			additionalCommonProperties: { workspaceRoot: '/Users/alice/project' },
+		});
+		logger.logUsage('safe-event', { count: 1 });
+		assert.strictEqual(functionSpy.dataArr.length, 0);
+		logger.dispose();
 	});
 
 	test('Ensure output channel is logged to', function () {

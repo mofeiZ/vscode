@@ -238,9 +238,22 @@ export class ExtHostTelemetryLogger {
 	/**
 	 * Fail-closed Path B guard. Runs before enablement checks / cleanData / sender
 	 * so OSS (telemetry often NONE) still records and blocks exfil attempts.
+	 * Scans event data + extension additionalCommonProperties under strict-shape.
 	 */
 	private _blockIfUserData(eventName: string, data: Record<string, any> | undefined): boolean {
-		const guard = detectTelemetryUserData(data ?? {}, this._getDataGuardMarkers());
+		const payload: Record<string, unknown> = { ...(data ?? {}) };
+		if (this._additionalCommonProperties) {
+			// G2: extension-supplied common props never reached the guard when only
+			// `data` was scanned (they were merged later in mixInCommonPropsAndCleanData).
+			for (const key of Object.getOwnPropertyNames(this._additionalCommonProperties)) {
+				payload[key] = this._additionalCommonProperties[key];
+			}
+		}
+		const guard = detectTelemetryUserData(payload, {
+			markers: this._getDataGuardMarkers(),
+			strictShape: true,
+			eventName,
+		});
 		if (!guard.hit) {
 			return false;
 		}
@@ -324,8 +337,21 @@ export class ExtHostTelemetryLogger {
 	}
 
 	logError(eventNameOrException: Error | string, data?: Record<string, any>): void {
-		if (typeof eventNameOrException === 'string' && this._blockIfUserData(eventNameOrException, data)) {
-			return;
+		// G1: call the guard unconditionally — including the idiomatic Error-object path.
+		if (typeof eventNameOrException === 'string') {
+			if (this._blockIfUserData(eventNameOrException, data)) {
+				return;
+			}
+		} else {
+			if (this._blockIfUserData('exception', {
+				name: eventNameOrException.name,
+				message: eventNameOrException.message,
+				stack: eventNameOrException.stack,
+				cause: eventNameOrException.cause,
+				...(data ?? {}),
+			})) {
+				return;
+			}
 		}
 		if (!this._telemetryEnablements.isErrorsEnabled || !this._sender) {
 			return;

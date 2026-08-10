@@ -4,14 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { joinPath } from '../../../../base/common/resources.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
-import { ILoggerService } from '../../../../platform/log/common/log.js';
+import { ILogger, ILoggerService } from '../../../../platform/log/common/log.js';
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IStorageService } from '../../../../platform/storage/common/storage.js';
 import { OneDataSystemWebAppender } from '../../../../platform/telemetry/browser/1dsAppender.js';
 import { ClassifiedEvent, IGDPRProperty, OmitMetadata, StrictPropertyCheck } from '../../../../platform/telemetry/common/gdprTypings.js';
 import { ITelemetryData, ITelemetryService, TelemetryLevel, TELEMETRY_SETTING_ID } from '../../../../platform/telemetry/common/telemetry.js';
+import { formatTelemetryGuardViolation } from '../../../../platform/telemetry/common/telemetryDataGuard.js';
 import { TelemetryLogAppender } from '../../../../platform/telemetry/common/telemetryLogAppender.js';
 import { ITelemetryServiceConfig, TelemetryService as BaseTelemetryService } from '../../../../platform/telemetry/common/telemetryService.js';
 import { getTelemetryLevel, isInternalTelemetry, isLoggingOnly, ITelemetryAppender, NullTelemetryService, supportsTelemetry } from '../../../../platform/telemetry/common/telemetryUtils.js';
@@ -29,6 +31,7 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 
 	private impl: ITelemetryService = NullTelemetryService;
 	public readonly sendErrorTelemetry = true;
+	private _dataGuardLogger: ILogger | undefined;
 
 	get sessionId(): string { return this.impl.sessionId; }
 	get machineId(): string { return this.impl.machineId; }
@@ -113,6 +116,19 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 				}
 			}
 			appenders.push(new TelemetryLogAppender('', false, loggerService, environmentService, productService));
+			// G4: wire onDataGuardViolation like electron-browser so web core-pipe
+			// hits are durably logged (previously a silent no-op).
+			if (!this._dataGuardLogger) {
+				this._dataGuardLogger = this._register(loggerService.createLogger(
+					joinPath(environmentService.extHostLogsPath, 'telemetry-guard.log'),
+					{
+						id: 'telemetryDataGuard',
+						name: 'Telemetry Data Guard',
+						logLevel: 'always',
+						hidden: true,
+					}
+				));
+			}
 			const config: ITelemetryServiceConfig = {
 				appenders,
 				commonProperties: resolveWorkbenchCommonProperties(storageService, productService, environmentService, isInternal, environmentService.options && environmentService.options.resolveCommonTelemetryProperties),
@@ -124,6 +140,9 @@ export class TelemetryService extends Disposable implements ITelemetryService {
 				sendErrorTelemetry: this.sendErrorTelemetry,
 				waitForExperimentProperties: experimentsEnabled(configurationService, productService, environmentService),
 				meteredConnectionService,
+				onDataGuardViolation: (violation) => {
+					this._dataGuardLogger?.info(formatTelemetryGuardViolation(violation));
+				},
 			};
 
 			return this._register(new BaseTelemetryService(config, configurationService, productService));

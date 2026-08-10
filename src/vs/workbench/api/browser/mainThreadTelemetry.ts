@@ -88,7 +88,14 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 			...this._workspaceContextService.getWorkspace().folders.map(f => f.uri.fsPath),
 			this._sessionCanary,
 		];
-		const guard = detectTelemetryUserData(data, markers);
+		const guard = detectTelemetryUserData(data, {
+			markers,
+			// See TelemetryService._doLog: Path A uses normalize + bounds, not the
+			// Path B string allowlist (keeps first-party EH telemetry working).
+			boundMeasurements: true,
+			failClosedOnDepthAbort: true,
+			eventName,
+		});
 		if (guard.hit) {
 			this._dataGuardLogger.info(formatTelemetryGuardViolation({
 				timestamp: new Date().toISOString(),

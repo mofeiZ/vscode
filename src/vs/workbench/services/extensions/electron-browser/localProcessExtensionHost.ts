@@ -28,6 +28,7 @@ import { INotificationService, NotificationPriority, Severity } from '../../../.
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IWorkbenchAssignmentService } from '../../assignment/common/assignmentService.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
+import { scrubPersistedExtensionHostLogLine } from '../../../../platform/telemetry/common/telemetryDataGuard.js';
 import { isLoggingOnly } from '../../../../platform/telemetry/common/telemetryUtils.js';
 import { IUserDataProfilesService } from '../../../../platform/userDataProfile/common/userDataProfile.js';
 import { IWorkspaceContextService, WorkbenchState, isUntitledWorkspace } from '../../../../platform/workspace/common/workspace.js';
@@ -296,16 +297,11 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			Event.map(onStderr.event, o => ({ data: `%c${o}`, format: ['color: red'] }))
 		);
 
-		// Persist the raw extension host process output (stdout/stderr) to a
-		// durable file under the exthost log directory. The output is otherwise
-		// only forwarded (debounced) to the renderer DevTools console. A native
-		// crash of the extension host process - e.g. a faulty native addon -
-		// prints to the process' stderr but never reaches the JavaScript layer,
-		// so it has no JS stack and (for utility processes) frequently produces
-		// no crash dump; it also cannot go through the extension host's own log
-		// service, which lives in the dying process. Capturing the raw output
-		// from the (surviving) renderer keeps such crashes diagnosable from the
-		// logs without requiring `--enable-smoke-test-driver`.
+		// Persist extension host process output (stdout/stderr) to a durable file
+		// under the exthost log directory. Native EH crashes never reach the JS
+		// layer; capturing output from the (surviving) renderer keeps them
+		// diagnosable. Lines are scrubbed for paths/secrets before persistence
+		// (F1) so this diagnostic sink is not an unguarded exfil channel.
 		const ehProcessLog = this._register(this._loggerService.createLogger(
 			joinPath(this._environmentService.extHostLogsPath, 'exthost-stderr.log'),
 			{
@@ -316,10 +312,14 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			}
 		));
 		this._ehProcessLog = ehProcessLog;
-		this._register(onStdout.event(line => ehProcessLog.info(`[stdout] ${line.replace(/\r?\n$/, '')}`)));
-		this._register(onStderr.event(line => ehProcessLog.error(`[stderr] ${line.replace(/\r?\n$/, '')}`)));
+		const persistEhLine = (channel: 'stdout' | 'stderr', line: string): string => {
+			const trimmed = line.replace(/\r?\n$/, '');
+			return `[${channel}] ${scrubPersistedExtensionHostLogLine(trimmed)}`;
+		};
+		this._register(onStdout.event(line => ehProcessLog.info(persistEhLine('stdout', line))));
+		this._register(onStderr.event(line => ehProcessLog.error(persistEhLine('stderr', line))));
 		// Also leave a breadcrumb in the window log for discoverability.
-		this._register(onStderr.event(line => this._logService.error(`[Extension Host (stderr)] ${line.replace(/\r?\n$/, '')}`)));
+		this._register(onStderr.event(line => this._logService.error(`[Extension Host (stderr)] ${scrubPersistedExtensionHostLogLine(line.replace(/\r?\n$/, ''))}`)));
 
 		// Debounce all output, so we can render it in the Chrome console as a group
 		const onDebouncedOutput = Event.debounce<Output>(onOutput, (r, o) => {

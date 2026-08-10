@@ -231,14 +231,25 @@ export class TelemetryService implements ITelemetryService {
 	}
 
 	private _doLog(eventName: string, eventLevel: TelemetryLevel, data?: ITelemetryData) {
-		// add experiment properties
+		// Merge experiment + common properties BEFORE the guard so they are scanned
+		// (G3). Previously _commonProperties reached appenders raw/unscanned.
 		data = mixin(data, this._experimentProperties);
+		data = mixin(data, this._commonProperties);
 
 		// Fail-closed data guard BEFORE cleanData / appenders. Extension-originated
-		// events (pluginHostTelemetry) are blocked on hit; core events are observed
-		// (logged) but still forwarded until the guard is tuned for first-party stacks.
+		// events (pluginHostTelemetry) use strict-shape allowlist and are blocked on
+		// hit; core events are observed (logged) but still forwarded until the guard
+		// is tuned for first-party stacks.
 		const pluginHostTelemetry = !!(data && (data as ITelemetryData)['pluginHostTelemetry']);
-		const guard = detectTelemetryUserData(data, this._dataGuardMarkers);
+		// Path A pluginHostTelemetry: normalize + bound measurements + fail-closed
+		// depth (collapses rt1 #1/#6/#7) without the Path B string allowlist, which
+		// would reject legitimate first-party EH free-form fields (activatePlugin).
+		const guard = detectTelemetryUserData(data, {
+			markers: this._dataGuardMarkers,
+			boundMeasurements: pluginHostTelemetry,
+			failClosedOnDepthAbort: pluginHostTelemetry,
+			eventName,
+		});
 		if (guard.hit) {
 			const violation: TelemetryGuardViolation = {
 				timestamp: new Date().toISOString(),
@@ -258,11 +269,8 @@ export class TelemetryService implements ITelemetryService {
 			}
 		}
 
-		// remove all PII from data
+		// remove all PII from data (includes common properties after G3 reorder)
 		data = cleanData(data, this._cleanupPatterns);
-
-		// add common properties
-		data = mixin(data, this._commonProperties);
 
 		// tag error-level events so the backend can identify them generically
 		if (eventLevel === TelemetryLevel.ERROR) {
