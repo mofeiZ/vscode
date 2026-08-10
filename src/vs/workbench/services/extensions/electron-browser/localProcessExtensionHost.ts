@@ -36,6 +36,12 @@ import { INativeWorkbenchEnvironmentService } from '../../environment/electron-b
 import { IShellEnvironmentService } from '../../environment/electron-browser/shellEnvironmentService.js';
 import { MessagePortExtHostConnection, writeExtHostConnection } from '../common/extensionHostEnv.js';
 import { createMessageOfType, IExtensionHostInitData, MessageType, NativeLogMarkers, UIKind, isMessageOfType } from '../common/extensionHostProtocol.js';
+import {
+	classifyExtensionHostExit,
+	formatUnexpectedExitBreadcrumb,
+	publishExtensionHostExitContext,
+	stderrLooksLikeOom,
+} from '../common/extensionHostCrashRecord.js';
 import { LocalProcessRunningLocation, localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../common/extensionRunningLocation.js';
 import { ExtensionHostExtensions, ExtensionHostStartup, IExtensionHost, IExtensionInspectInfo, resolveEnabledApiProposalsFallbackExperiment } from '../common/extensions.js';
 import { IHostService } from '../../host/browser/host.js';
@@ -69,6 +75,10 @@ export class ExtensionHostProcess {
 
 	public get onExit(): Event<{ code: number; signal: string }> {
 		return this._extensionHostStarter.onDynamicExit(this._id);
+	}
+
+	public get onCrash(): Event<{ code: number; reason: string }> {
+		return this._extensionHostStarter.onDynamicCrash(this._id);
 	}
 
 	constructor(
@@ -121,6 +131,11 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 	private _extensionHostProcess: ExtensionHostProcess | null;
 	private _messageProtocol: Promise<IMessagePassingProtocol> | null;
 	private _ehProcessLog: ILogger | null = null;
+	/** Electron `child-process-gone` enrichment; may arrive before or after `onExit`. */
+	private _lastCrashInfo: { code: number; reason: string } | undefined;
+	private _stderrOomSeen = false;
+	private _processStartedAtMs: number | undefined;
+	private _exitEmitScheduled = false;
 
 	constructor(
 		public readonly runningLocation: LocalProcessRunningLocation,
@@ -320,7 +335,12 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			return `[${channel}] ${scrubPersistedExtensionHostLogLine(trimmed)}`;
 		};
 		this._register(onStdout.event(line => ehProcessLog.info(persistEhLine('stdout', line))));
-		this._register(onStderr.event(line => ehProcessLog.error(persistEhLine('stderr', line))));
+		this._register(onStderr.event(line => {
+			if (stderrLooksLikeOom(line)) {
+				this._stderrOomSeen = true;
+			}
+			ehProcessLog.error(persistEhLine('stderr', line));
+		}));
 		// Also leave a breadcrumb in the window log for discoverability.
 		this._register(onStderr.event(line => this._logService.error(`[Extension Host (stderr)] ${scrubPersistedExtensionHostLogLine(line.replace(/\r?\n$/, ''))}`)));
 
@@ -353,8 +373,12 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			}
 		}));
 
-		// Lifecycle
-
+		// Lifecycle — `onCrash` (Electron reason) and `onExit` can arrive in either
+		// order; hold crash info as enrichment and debounce the exit record one tick.
+		this._processStartedAtMs = Date.now();
+		this._register(this._extensionHostProcess.onCrash(({ code, reason }) => {
+			this._lastCrashInfo = { code, reason };
+		}));
 		this._register(this._extensionHostProcess.onExit(({ code, signal }) => this._onExtHostProcessExit(code, signal)));
 
 		// Notify debugger that we are ready to attach to the process if we run a development extension
@@ -604,10 +628,64 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			// Expected termination path (we asked the process to terminate)
 			return;
 		}
+		if (this._exitEmitScheduled) {
+			return;
+		}
+		this._exitEmitScheduled = true;
+
+		// Debounce one tick so a late `onCrash` reason still lands in one record.
+		setTimeout(() => this._emitUnexpectedExit(code, signal), 0);
+	}
+
+	private _emitUnexpectedExit(code: number, signal: string): void {
+		if (this._terminating) {
+			return;
+		}
+
+		const reason = this._lastCrashInfo?.reason ?? 'unknown';
+		const lastRssBucketMb: number | null = null; // u29 sampler stamps this when present
+		const lastHeapUsedMb: number | null = null;
+		const classification = classifyExtensionHostExit({
+			code,
+			reason,
+			stderrOomSeen: this._stderrOomSeen,
+			lastRssBucketMb,
+		});
+		const uptimeSec = this._processStartedAtMs === undefined
+			? 0
+			: Math.max(0, Math.round((Date.now() - this._processStartedAtMs) / 1000));
+		const pid = this.pid ?? 0;
 
 		// Structured crash breadcrumb into the exthost log directory so unexpected
 		// EH deaths remain visible even when no stderr was flushed.
-		this._ehProcessLog?.error(`Extension host exited unexpectedly: code=${code} signal=${signal} pid=${this.pid}`);
+		this._ehProcessLog?.error(formatUnexpectedExitBreadcrumb({
+			code,
+			signal,
+			pid: this.pid,
+			reason,
+			exitClass: classification.exitClass,
+			oomSuspected: classification.oomSuspected,
+			lastRssBucketMb,
+		}));
+
+		if (this.pid !== null) {
+			publishExtensionHostExitContext({
+				code,
+				signal,
+				reason,
+				stderrOomSeen: this._stderrOomSeen,
+				affinity: this.runningLocation.affinity,
+				pid,
+				uptimeSec,
+				lastRssBucketMb,
+				lastHeapUsedMb,
+				secondsSinceLastSample: null,
+				secondsSinceLastAlert: null,
+				exitClass: classification.exitClass,
+				oomSuspected: classification.oomSuspected,
+				oomHeuristic: classification.oomHeuristic,
+			});
+		}
 
 		this._onExit.fire([code, signal]);
 	}

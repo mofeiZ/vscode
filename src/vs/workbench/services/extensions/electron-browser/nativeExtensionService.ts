@@ -34,6 +34,7 @@ import { IRemoteExtensionsScannerService } from '../../../../platform/remote/com
 import { getRemoteName, isLoopbackHost, parseAuthorityWithPort } from '../../../../platform/remote/common/remoteHosts.js';
 import { updateProxyConfigurationsScope } from '../../../../platform/request/common/request.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
+import { detectTelemetryUserData } from '../../../../platform/telemetry/common/telemetryDataGuard.js';
 import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
 import { IWorkspaceTrustManagementService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IWorkbenchEnvironmentService } from '../../environment/common/environmentService.js';
@@ -42,6 +43,16 @@ import { IWebWorkerExtensionHostDataProvider, IWebWorkerExtensionHostInitData, W
 import { AbstractExtensionService, ExtensionHostCrashTracker, IExtensionHostFactory, LocalExtensions, RemoteExtensions, ResolvedExtensions, ResolverExtensions, checkEnabledAndProposedAPI, extensionIsEnabled, isResolverExtension } from '../common/abstractExtensionService.js';
 import { ExtensionDescriptionRegistrySnapshot } from '../common/extensionDescriptionRegistry.js';
 import { parseExtensionDevOptions } from '../common/extensionDevOptions.js';
+import {
+	buildExtensionHostCrashRecord,
+	classifyExtensionHostExit,
+	consumeExtensionHostExitContext,
+	crashRecordTelemetryData,
+	flushPendingExtensionHostCrashRecords,
+	markPendingCrashRecordSentInSession,
+	writePendingExtensionHostCrashRecord,
+	type ExtensionHostCrashRecord,
+} from '../common/extensionHostCrashRecord.js';
 import { ExtensionHostKind, ExtensionRunningPreference, IExtensionHostKindPicker, extensionHostKindToString, extensionRunningPreferenceToString } from '../common/extensionHostKind.js';
 import { IExtensionHostManager } from '../common/extensionHostManagers.js';
 import { ExtensionHostExitCode } from '../common/extensionHostProtocol.js';
@@ -137,6 +148,7 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 		lifecycleService.when(LifecyclePhase.Ready).then(() => {
 			// reschedule to ensure this runs after restoring viewlets, panels, and editors
 			runWhenWindowIdle(mainWindow, () => {
+				this._flushPendingExtensionHostCrashRecords();
 				this._initializeIfNeeded();
 			}, 50 /*max delay*/);
 		});
@@ -179,6 +191,7 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 
 			this._logExtensionHostCrash(extensionHost);
 			this._sendExtensionHostCrashTelemetry(code, signal, activatedExtensions);
+			this._persistAndEmitExtensionHostCrashRecord(extensionHost, code, signal, activatedExtensions);
 
 			this._localCrashTracker.registerCrash();
 
@@ -265,6 +278,101 @@ export class NativeExtensionService extends AbstractExtensionService implements 
 				extensionId: extensionId.value
 			});
 		}
+	}
+
+	/**
+	 * Durable numbers-only crash record under `<userDataPath>/pending-errors/`
+	 * plus immediate `exthostCrashRecord` telemetry (guard-checked). The pending
+	 * file covers the case where the window dies before the event leaves.
+	 */
+	private _persistAndEmitExtensionHostCrashRecord(
+		extensionHost: IExtensionHostManager,
+		code: number,
+		signal: string | null,
+		activatedExtensions: ExtensionIdentifier[],
+	): void {
+		const ctx = consumeExtensionHostExitContext(extensionHost.pid);
+		const reason = ctx?.reason ?? 'unknown';
+		const classification = ctx
+			? {
+				exitClass: ctx.exitClass,
+				oomSuspected: ctx.oomSuspected,
+				oomHeuristic: ctx.oomHeuristic,
+				electronOom: reason === 'oom' || reason === 'memory-eviction',
+				stderrOom: ctx.stderrOomSeen,
+			}
+			: classifyExtensionHostExit({
+				code,
+				reason,
+				stderrOomSeen: false,
+				lastRssBucketMb: null,
+			});
+		const extensionIds = activatedExtensions.map(e => e.value);
+		const record = buildExtensionHostCrashRecord({
+			ts: Date.now(),
+			code,
+			signal: signal ?? 'unknown',
+			reason,
+			classification,
+			affinity: ctx?.affinity ?? 0,
+			pid: ctx?.pid ?? extensionHost.pid ?? 0,
+			uptimeSec: ctx?.uptimeSec ?? 0,
+			lastRssBucketMb: ctx?.lastRssBucketMb ?? null,
+			lastHeapUsedMb: ctx?.lastHeapUsedMb ?? null,
+			secondsSinceLastSample: ctx?.secondsSinceLastSample ?? null,
+			secondsSinceLastAlert: ctx?.secondsSinceLastAlert ?? null,
+			extensionIds,
+		});
+
+		const userDataHome = URI.file(this._environmentService.userDataPath);
+		void this._writePendingCrashRecordAndEmit(userDataHome, record);
+	}
+
+	private async _writePendingCrashRecordAndEmit(userDataHome: URI, record: ExtensionHostCrashRecord): Promise<void> {
+		try {
+			const resource = await writePendingExtensionHostCrashRecord(this._fileService, userDataHome, record);
+			const emitted = this._emitGuardedCrashTelemetry('exthostCrashRecord', crashRecordTelemetryData(record));
+			if (emitted) {
+				await markPendingCrashRecordSentInSession(this._fileService, resource, record);
+			}
+		} catch (err) {
+			this._logService.warn('Failed to persist extension host crash record', err);
+		}
+	}
+
+	private async _flushPendingExtensionHostCrashRecords(): Promise<void> {
+		try {
+			const userDataHome = URI.file(this._environmentService.userDataPath);
+			const nowMs = Date.now();
+			await flushPendingExtensionHostCrashRecords(
+				this._fileService,
+				userDataHome,
+				nowMs,
+				(record, flushDelaySec) => {
+					this._emitGuardedCrashTelemetry(
+						'exthostCrashFlush',
+						crashRecordTelemetryData(record, { flushDelaySec }),
+					);
+				},
+			);
+		} catch (err) {
+			this._logService.warn('Failed to flush pending extension host crash records', err);
+		}
+	}
+
+	/** Pre-check with the Path-A numeric guard; skip emit on hit (no mainThreadTelemetry touch). */
+	private _emitGuardedCrashTelemetry(eventName: string, data: Record<string, unknown>): boolean {
+		const guard = detectTelemetryUserData(data, {
+			boundMeasurements: true,
+			failClosedOnDepthAbort: true,
+			eventName,
+		});
+		if (guard.hit) {
+			this._logService.warn(`Blocked ${eventName} telemetry: ${guard.layer}`);
+			return false;
+		}
+		this._telemetryService.publicLog(eventName, data);
+		return true;
 	}
 
 	// --- impl
