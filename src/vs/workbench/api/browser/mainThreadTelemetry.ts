@@ -30,6 +30,8 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 
 	private readonly _sessionCanary: string;
 	private readonly _dataGuardLogger: ILogger;
+	/** LocalProcess affinity from u25; stamped onto per-EH memory events. */
+	private readonly _affinity: number;
 
 	constructor(
 		extHostContext: IExtHostContext,
@@ -48,6 +50,7 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 		// LocalProcess affinity hosts each get their own telemetry-guard.log; other
 		// kinds keep the window default extHostLogsPath (affinity ignored).
 		const affinity = extHostContext.affinity ?? 0;
+		this._affinity = affinity;
 		const guardLogsPath = extHostContext.extensionHostKind === ExtensionHostKind.LocalProcess
 			? localProcessExtensionHostLogsPath(this._workbenchEnvironmentService.extHostLogsPath, affinity)
 			: this._workbenchEnvironmentService.extHostLogsPath;
@@ -96,6 +99,11 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 	$publicLog(eventName: string, data: ITelemetryData = Object.create(null)): void {
 		// __GDPR__COMMON__ "pluginHostTelemetry" : { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true }
 		data[MainThreadTelemetry._name] = true;
+
+		// Per-EH memory events: stamp affinity/host id main-thread-side (EH does not know it).
+		if (eventName === 'exthostMemorySample' || eventName === 'exthostMemoryAlert') {
+			data['affinity'] = this._affinity;
+		}
 
 		// Pre-check so EH IPC violations are attributed here even if core telemetry is Null.
 		const markers = [
