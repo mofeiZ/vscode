@@ -48,8 +48,9 @@ import {
 import {
 	decodeSnapshotFile,
 	extractClassGroups,
+	getAllocationSamplingProfile,
 	startAllocationSampling,
-	stopAndGetProfile,
+	TIER0_SAMPLING_INTERVAL_BYTES,
 	writeSnapshot,
 } from '../../services/extensions/node/extensionHostHeapCapture.js';
 import { IExtHostCommands } from '../common/extHostCommands.js';
@@ -225,7 +226,7 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 		this._heapDiagnosis = new HeapDiagnosisCoordinator({
 			writeSnapshot,
 			startSampling: startAllocationSampling,
-			stopAndGetProfile,
+			getSamplingProfile: getAllocationSamplingProfile,
 			extractClassGroupsFromSnapshot: async (path) => extractClassGroups(await decodeSnapshotFile(path)),
 			delay: (ms) => timeout(ms),
 			nowMs: () => Date.now(),
@@ -233,14 +234,15 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			artifactDirFsPath,
 			pid: this._hostUtils.pid ?? process.pid,
 			affinity: 0, // stamped main-thread-side on telemetry emit
+			tier0SamplingIntervalBytes: TIER0_SAMPLING_INTERVAL_BYTES,
 			emitSafeSummary: (summary) => {
 				type ExtHostHeapAttributionClassification = {
 					owner: 'anyarchive';
-					comment: 'Guard-safe heap attribution summary after alert/on-demand capture. Opaque ids + buckets only.';
+					comment: 'Guard-safe heap attribution summary (Tier-0 sampling or Tier-1 capture). Opaque ids + buckets/enums only.';
 					schema: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Summary schema version' };
 					affinity: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Host affinity (main-stamped)' };
 					pid: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Opaque process id' };
-					snapshotSeq: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Capture pair sequence' };
+					snapshotSeq: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Capture/attribution sequence' };
 					extensions: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; comment: 'Top opaque extension attribution rows' };
 					grownClassGroups: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; comment: 'Top opaque grown class-group rows' };
 					topDominatorRetainedBucketMb: { classification: 'SystemMetaData'; purpose: 'PerformanceAndHealth'; isMeasurement: true; comment: 'Top dominator retained bucket MB' };
@@ -259,6 +261,11 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 				this._logService.info(`[exthostHeapDiagnosis]\n${text}`);
 			},
 			isGateEnabled: () => isInternalDiagnosticsEnabled(),
+		});
+
+		// Tier-0: always-on low-rate allocation sampler (NOT gated by internal-diagnostics).
+		void this._heapDiagnosis.startContinuousSampling().catch(err => {
+			this._logService.warn('[exthostHeapDiagnosis] Tier-0 sampling failed to start', err);
 		});
 
 		const commands = this._instaService.invokeFunction(accessor => accessor.get(IExtHostCommands));
@@ -338,6 +345,9 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			);
 		}
 
+		// Tier-0 low-cadence attribution flush (rate-limited inside coordinator; not gated).
+		this._heapDiagnosis?.onAttributionCadence();
+
 		const decision = decideMemoryAlert(
 			{ rssBucketMb: sample.rssBucketMb, growthMbPerMin: sample.growthMbPerMin },
 			this._memoryAlertState,
@@ -377,11 +387,16 @@ export class ExtHostExtensionService extends AbstractExtHostExtensionService {
 			buildMemoryAlertTelemetryPayload(sample, decision.trigger, decision.thresholdBucketMb ?? 3072),
 		);
 
-		// DETECT → ATTRIBUTE/DIAGNOSE: rate-limited heap snapshot pair + safe summary.
-		// Automatic capture is Tier-1 (internal-diagnostics gate); sampler alert itself stays Tier-0.
+		// DETECT → ATTRIBUTE: Tier-0 sampling attribution (always-on, not gated).
+		// Tier-1 raw snapshot pair stays behind the internal-diagnostics gate (r16).
 		const heap = this._heapDiagnosis?.onMemoryAlert();
-		if (heap && !heap.started) {
-			this._logService.trace(`[exthostHeapDiagnosis] alert capture skipped: ${heap.reason}`);
+		if (heap) {
+			if (!heap.attribution.started) {
+				this._logService.trace(`[exthostHeapDiagnosis] Tier-0 attribution skipped: ${heap.attribution.reason}`);
+			}
+			if (!heap.snapshot.started) {
+				this._logService.trace(`[exthostHeapDiagnosis] Tier-1 snapshot skipped: ${heap.snapshot.reason}`);
+			}
 		}
 	}
 

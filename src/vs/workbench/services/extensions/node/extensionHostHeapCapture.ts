@@ -20,7 +20,14 @@ import {
 	type HeapClassGroupSummary,
 } from '../common/extensionHostHeapDiagnosis.js';
 
-const DEFAULT_SAMPLING_INTERVAL_BYTES = 131_072;
+/** Default interval for short Tier-1 capture windows (r11). */
+export const DEFAULT_SAMPLING_INTERVAL_BYTES = 131_072;
+
+/**
+ * Always-on Tier-0 interval (512 KiB). Higher than the capture-window default
+ * to keep continuous overhead low; measured ~4–6% under alloc-heavy microbench.
+ */
+export const TIER0_SAMPLING_INTERVAL_BYTES = 524_288;
 
 /** Lazy `@vscode/v8-heap-parser` surface (WASM; node build). */
 export interface V8HeapParserGraph {
@@ -71,9 +78,15 @@ export function writeSnapshot(path: string): string {
 	return v8.writeHeapSnapshot(path);
 }
 
+/** Whether continuous / capture-window allocation sampling is active. */
+export function isAllocationSamplingActive(): boolean {
+	return samplingActive;
+}
+
 /**
  * Start in-process allocation sampling (`HeapProfiler.startSampling`).
- * Default interval 128 KiB (r11).
+ * Idempotent while already active (Tier-0 continuous sampler stays on).
+ * Default interval 128 KiB (r11); Tier-0 always-on uses {@link TIER0_SAMPLING_INTERVAL_BYTES}.
  */
 export async function startAllocationSampling(intervalBytes: number = DEFAULT_SAMPLING_INTERVAL_BYTES): Promise<void> {
 	if (samplingActive) {
@@ -85,6 +98,18 @@ export async function startAllocationSampling(intervalBytes: number = DEFAULT_SA
 	await post(samplingSession, 'HeapProfiler.enable');
 	await post(samplingSession, 'HeapProfiler.startSampling', { samplingInterval: intervalBytes });
 	samplingActive = true;
+}
+
+/**
+ * Read the current sampling profile without stopping (CDP `getSamplingProfile`).
+ * Used by the always-on Tier-0 attribution lane.
+ */
+export async function getAllocationSamplingProfile(): Promise<AllocationSamplingProfile> {
+	if (!samplingSession || !samplingActive) {
+		throw new Error('allocation sampling is not active');
+	}
+	const result = await post(samplingSession, 'HeapProfiler.getSamplingProfile') as { profile: AllocationSamplingProfile };
+	return result.profile;
 }
 
 /** Stop sampling and return the CDP sampling profile. */

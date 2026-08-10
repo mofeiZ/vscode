@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { URI } from '../../../../../base/common/uri.js';
 import { detectTelemetryUserData } from '../../../../../platform/telemetry/common/telemetryDataGuard.js';
 import {
+	analyzeSamplingAttribution,
 	assertSafeSummaryShape,
 	attributeSamplingProfile,
 	buildSafeSummary,
@@ -44,6 +45,80 @@ suite('extensionHostHeapDiagnosis', function () {
 		const deltas = diffClassGroups(before, after);
 		assert.strictEqual(deltas[0]!.name, 'Array');
 		assert.ok(deltas[0]!.retainedDelta > deltas[1]!.retainedDelta);
+	});
+
+	test('analyzeSamplingAttribution (Tier-0) emits enriched enum/shape fields with no raw strings', () => {
+		const leakyDir = '/tmp/exts/leaky.ext';
+		const tidyDir = '/tmp/exts/tidy.ext';
+		const profile = {
+			head: {
+				id: 1,
+				selfSize: 0,
+				callFrame: { functionName: '(root)', scriptId: '0', url: '', lineNumber: 0, columnNumber: 0 },
+				children: [
+					{
+						id: 2,
+						selfSize: 180 * 1024 * 1024,
+						callFrame: {
+							functionName: 'activateEvent',
+							scriptId: '1',
+							url: URI.file(`${leakyDir}/extension.js`).toString(true),
+							lineNumber: 10,
+							columnNumber: 0,
+						},
+						children: [],
+					},
+					{
+						id: 3,
+						selfSize: 20 * 1024 * 1024,
+						callFrame: {
+							functionName: 'activateEvent',
+							scriptId: '2',
+							url: URI.file(`${tidyDir}/extension.js`).toString(true),
+							lineNumber: 10,
+							columnNumber: 0,
+						},
+						children: [],
+					},
+				],
+			},
+		};
+		const { summary, reportMeta } = analyzeSamplingAttribution({
+			profile,
+			extensionLocations: [
+				{ id: 'leaky.ext', location: URI.file(leakyDir) },
+				{ id: 'tidy.ext', location: URI.file(tidyDir) },
+			],
+			pid: 7,
+			snapshotSeq: 3,
+		});
+		assertSafeSummaryShape(summary);
+		assert.strictEqual(summary.extensions[0]!.extRef, 'ext-1');
+		assert.ok(summary.extensions[0]!.sharePct >= 60);
+		assert.ok(['high', 'medium', 'low'].includes(summary.extensions[0]!.confidence));
+		assert.strictEqual(typeof summary.extensions[0]!.lanesAgree, 'boolean');
+		assert.ok(summary.grownClassGroups.length >= 1);
+		assert.ok(['array', 'string', 'object', 'closure', 'map-set', 'arraybuffer', 'regexp', 'promise', 'native', 'other']
+			.includes(summary.grownClassGroups[0]!.category));
+		assert.ok(typeof summary.dominatorDepth === 'number');
+		assert.ok(typeof summary.dominatorFanout === 'number');
+		assert.ok(typeof summary.retainedTopSharePct === 'number');
+		assert.ok(reportMeta.text.includes('leaky.ext'));
+		const json = JSON.stringify(summary);
+		assert.ok(!json.includes('leaky.ext'));
+		assert.ok(!json.includes('/tmp/'));
+		assert.ok(!json.includes('activateEvent'));
+		assert.ok(!json.includes('sampled-live'));
+		const guard = detectTelemetryUserData(
+			{ ...summary, pluginHostTelemetry: true },
+			{
+				markers: ['/tmp/exts/leaky.ext', 'leaky.ext'],
+				boundMeasurements: true,
+				failClosedOnDepthAbort: true,
+				eventName: 'exthostHeapAttribution',
+			},
+		);
+		assert.strictEqual(guard.hit, false, `Tier-0 sampling summary must pass guard, got ${JSON.stringify(guard)}`);
 	});
 
 	test('buildSafeSummary is opaque ids / enums / numbers only and passes the guard', () => {

@@ -394,6 +394,60 @@ export function primaryGrownRetainedBytes(deltas: readonly HeapClassGroupDelta[]
 	return best;
 }
 
+/**
+ * Tier-0 sampling-only attribution: fold live sampled bytes → extensions, then
+ * build a guard-safe summary with enum/shape fields (no snapshot required).
+ * Class-group rows use closed category enums only; local report may say "sampled-live".
+ */
+export function analyzeSamplingAttribution(args: {
+	readonly profile: AllocationSamplingProfile;
+	readonly extensionLocations: readonly ExtensionLocationRef[];
+	readonly affinity?: number;
+	readonly pid?: number;
+	readonly snapshotSeq?: number;
+}): { readonly summary: ExtHostHeapAttributionSafeSummary; readonly reportMeta: HeapDiagnosisLocalReport } {
+	const lane1 = attributeSamplingProfile(args.profile, args.extensionLocations);
+	const totalLive = sumValues(lane1);
+	const attribution = mergeAttribution(lane1, new Map(), totalLive);
+	const { grown, dominator } = samplingDerivedDiagnostics(attribution, totalLive);
+	return buildSafeSummary({
+		attribution,
+		grown,
+		dominator,
+		retainer: { pathLen: 0, edgeTypes: [], nodeCategories: grown.slice(0, 2).map(g => g.category) },
+		affinity: args.affinity,
+		pid: args.pid,
+		snapshotSeq: args.snapshotSeq,
+	});
+}
+
+/** Shape + enum stand-ins when only the allocation sampler is available (no snapshot). */
+export function samplingDerivedDiagnostics(
+	attribution: readonly ExtensionAttributionRow[],
+	totalLiveBytes: number,
+): { readonly grown: HeapClassGroupDelta[]; readonly dominator: DominatorShape } {
+	const top = attribution[0];
+	const grown: HeapClassGroupDelta[] = totalLiveBytes > 0
+		? [{
+			name: 'sampled-live',
+			category: 'other',
+			countDelta: Math.max(1, attribution.length),
+			selfDelta: totalLiveBytes,
+			retainedDelta: totalLiveBytes,
+		}]
+		: [];
+	return {
+		grown,
+		dominator: {
+			topDominatorRetainedBytes: top?.liveSampledBytes ?? 0,
+			dominatorDepth: 1,
+			dominatorFanout: Math.max(1, attribution.length),
+			retainedTopSharePct: top?.sharePct ?? 0,
+			topDominatorName: 'sampled-live',
+		},
+	};
+}
+
 export function buildSafeSummary(args: {
 	readonly attribution: readonly ExtensionAttributionRow[];
 	readonly grown: readonly HeapClassGroupDelta[];
