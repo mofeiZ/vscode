@@ -13,6 +13,8 @@ import { IRPCProtocol, ProxyIdentifier } from './proxyIdentifier.js';
 export interface IExtHostContext extends IRPCProtocol {
 	readonly remoteAuthority: string | null;
 	readonly extensionHostKind: ExtensionHostKind;
+	/** LocalProcess affinity (0 = default shared host). Optional; missing means 0. */
+	readonly affinity?: number;
 }
 
 export interface IInternalExtHostContext extends IExtHostContext {

@@ -13,6 +13,7 @@ import { ExtensionRunningLocationTracker } from '../../common/extensionRunningLo
 import { ExtensionHostKind, IExtensionHostKindPicker } from '../../common/extensionHostKind.js';
 import { IExtensionManifestPropertiesService } from '../../common/extensionManifestPropertiesService.js';
 import { IReadOnlyExtensionDescriptionRegistry } from '../../common/extensionDescriptionRegistry.js';
+import { localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../../common/extensionRunningLocation.js';
 import { IWorkbenchEnvironmentService } from '../../../environment/common/environmentService.js';
 
 function createExtension(id: string, deps?: string[], extensionAffinity?: string[]): IExtensionDescription {
@@ -255,5 +256,14 @@ suite('ExtensionRunningLocationTracker - extensionAffinity', () => {
 		const locDesk = runningLocations.get(deskGnome.identifier);
 		assert.ok(locDesk);
 		assert.strictEqual(locDesk!.affinity, 0, 'Debug / extensionDevelopmentPath must skip affinity');
+	});
+
+	test('localProcessExtensionHostLogsPath suffixes by affinity', () => {
+		const base = URI.file('/tmp/logs/window1/exthost');
+		assert.strictEqual(localProcessExtensionHostLogsPath(base, 0).fsPath, base.fsPath);
+		assert.strictEqual(localProcessExtensionHostLogsPath(base, 1).fsPath, '/tmp/logs/window1/exthost1');
+		assert.strictEqual(localProcessExtensionHostLogsPath(base, 2).fsPath, '/tmp/logs/window1/exthost2');
+		assert.strictEqual(localProcessExtensionHostLogId('exthostStderr', 0), 'exthostStderr');
+		assert.strictEqual(localProcessExtensionHostLogId('exthostStderr', 1), 'exthostStderr.1');
 	});
 });

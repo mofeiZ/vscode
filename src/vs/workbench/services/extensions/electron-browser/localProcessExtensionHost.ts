@@ -36,7 +36,7 @@ import { INativeWorkbenchEnvironmentService } from '../../environment/electron-b
 import { IShellEnvironmentService } from '../../environment/electron-browser/shellEnvironmentService.js';
 import { MessagePortExtHostConnection, writeExtHostConnection } from '../common/extensionHostEnv.js';
 import { createMessageOfType, IExtensionHostInitData, MessageType, NativeLogMarkers, UIKind, isMessageOfType } from '../common/extensionHostProtocol.js';
-import { LocalProcessRunningLocation } from '../common/extensionRunningLocation.js';
+import { LocalProcessRunningLocation, localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../common/extensionRunningLocation.js';
 import { ExtensionHostExtensions, ExtensionHostStartup, IExtensionHost, IExtensionInspectInfo, resolveEnabledApiProposalsFallbackExperiment } from '../common/extensions.js';
 import { IHostService } from '../../host/browser/host.js';
 import { ILifecycleService, WillShutdownEvent } from '../../lifecycle/common/lifecycle.js';
@@ -298,14 +298,17 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 		);
 
 		// Persist extension host process output (stdout/stderr) to a durable file
-		// under the exthost log directory. Native EH crashes never reach the JS
-		// layer; capturing output from the (surviving) renderer keeps them
-		// diagnosable. Lines are scrubbed for paths/secrets before persistence
-		// (F1) so this diagnostic sink is not an unguarded exfil channel.
+		// under this host's affinity-suffixed exthost log directory. Native EH
+		// crashes never reach the JS layer; capturing output from the (surviving)
+		// renderer keeps them diagnosable. Lines are scrubbed for paths/secrets
+		// before persistence (F1) so this diagnostic sink is not an unguarded
+		// exfil channel. Affinity > 0 must not share the affinity-0 logger path/id.
+		const affinity = this.runningLocation.affinity;
+		const hostLogsPath = localProcessExtensionHostLogsPath(this._environmentService.extHostLogsPath, affinity);
 		const ehProcessLog = this._register(this._loggerService.createLogger(
-			joinPath(this._environmentService.extHostLogsPath, 'exthost-stderr.log'),
+			joinPath(hostLogsPath, 'exthost-stderr.log'),
 			{
-				id: 'exthostStderr',
+				id: localProcessExtensionHostLogId('exthostStderr', affinity),
 				name: nls.localize('exthostStderr', "Extension Host Stderr"),
 				logLevel: 'always',
 				hidden: true,
@@ -587,7 +590,9 @@ export class NativeLocalProcessExtensionHost extends Disposable implements IExte
 			virtualWorkspaceExtensionTips: this._productService.virtualWorkspaceExtensionTips,
 			logLevel: this._logService.getLevel(),
 			loggers: [...this._loggerService.getRegisteredLoggers()],
-			logsLocation: this._environmentService.extHostLogsPath,
+			// Affinity-suffixed so EH-side loggers (e.g. telemetry-guard.log) land
+			// in this host's own directory, not the shared affinity-0 exthost/.
+			logsLocation: localProcessExtensionHostLogsPath(this._environmentService.extHostLogsPath, this.runningLocation.affinity),
 			autoStart: (this.startup === ExtensionHostStartup.EagerAutoStart),
 			uiKind: UIKind.Desktop,
 			handle: this._environmentService.window.handle ? encodeBase64(this._environmentService.window.handle) : undefined

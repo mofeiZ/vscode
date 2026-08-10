@@ -18,6 +18,8 @@ import { supportsTelemetry } from '../../../platform/telemetry/common/telemetryU
 import { IWorkspaceContextService } from '../../../platform/workspace/common/workspace.js';
 import { IWorkbenchEnvironmentService } from '../../services/environment/common/environmentService.js';
 import { extHostNamedCustomer, IExtHostContext } from '../../services/extensions/common/extHostCustomers.js';
+import { ExtensionHostKind } from '../../services/extensions/common/extensionHostKind.js';
+import { localProcessExtensionHostLogId, localProcessExtensionHostLogsPath } from '../../services/extensions/common/extensionRunningLocation.js';
 import { ExtHostContext, ExtHostTelemetryShape, MainContext, MainThreadTelemetryShape } from '../common/extHost.protocol.js';
 
 @extHostNamedCustomer(MainContext.MainThreadTelemetry)
@@ -43,10 +45,16 @@ export class MainThreadTelemetry extends Disposable implements MainThreadTelemet
 
 		this._proxy = extHostContext.getProxy(ExtHostContext.ExtHostTelemetry);
 		this._sessionCanary = `ANYARCHIVE_TEL_CANARY_${generateUuid()}`;
+		// LocalProcess affinity hosts each get their own telemetry-guard.log; other
+		// kinds keep the window default extHostLogsPath (affinity ignored).
+		const affinity = extHostContext.affinity ?? 0;
+		const guardLogsPath = extHostContext.extensionHostKind === ExtensionHostKind.LocalProcess
+			? localProcessExtensionHostLogsPath(this._workbenchEnvironmentService.extHostLogsPath, affinity)
+			: this._workbenchEnvironmentService.extHostLogsPath;
 		this._dataGuardLogger = this._register(loggerService.createLogger(
-			joinPath(this._workbenchEnvironmentService.extHostLogsPath, 'telemetry-guard.log'),
+			joinPath(guardLogsPath, 'telemetry-guard.log'),
 			{
-				id: 'telemetryDataGuardMain',
+				id: localProcessExtensionHostLogId('telemetryDataGuardMain', extHostContext.extensionHostKind === ExtensionHostKind.LocalProcess ? affinity : 0),
 				name: 'Telemetry Data Guard',
 				logLevel: 'always',
 				hidden: true,
